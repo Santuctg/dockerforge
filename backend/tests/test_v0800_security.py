@@ -86,3 +86,19 @@ def test_logs_allowed_for_operator(make_client, monkeypatch):
 def test_ui_hides_logs_tab_from_viewers():
     from app.ui import HTML
     assert "if(!canOperate())content.textContent='Operator permission required.';else await setupLogWorkspace(content,id);" in HTML
+
+
+def test_prune_failed_drops_expired_entries():
+    core._failed.clear()
+    core._failed.update({('1.1.1.1', 'old'): [100, 200], ('1.1.1.1', 'new'): [100, 950]})
+    core.prune_failed(1000)
+    assert set(core._failed) == {('1.1.1.1', 'new')}
+
+
+def test_prune_failed_caps_keys_keeping_newest():
+    core._failed.clear()
+    for i in range(5):
+        core._failed[('ip', f'u{i}')] = [900 + i]
+    core.prune_failed(1000, cap=3)
+    assert set(core._failed) == {('ip', 'u2'), ('ip', 'u3'), ('ip', 'u4')}
+    core._failed.clear()

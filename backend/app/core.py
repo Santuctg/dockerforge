@@ -50,6 +50,12 @@ def audit(req, action, result='success', user=None, resource=None, metadata=None
     with conn() as db:
         db.execute('INSERT INTO audit(ts,actor,action,resource,ip,result,request_id,metadata) VALUES(?,?,?,?,?,?,?,?)',(int(time.time()),user,action,resource,client_ip(req),result,getattr(req.state,'request_id',''),json.dumps(redact(metadata or {}))))
 
+def prune_failed(now,cap=10000):
+    # Keep login rate-limit state bounded: forget expired keys, then cap by most recent attempt.
+    for key in [k for k,v in _failed.items() if not any(t>now-300 for t in v)]:_failed.pop(key,None)
+    if len(_failed)>cap:
+        for key in sorted(_failed,key=lambda k:max(_failed[k]))[:len(_failed)-cap]:_failed.pop(key,None)
+
 def fail(code,message,status):raise HTTPException(status_code=status,detail={'code':code,'message':message})
 def user_from_session(req):
     token=req.cookies.get(COOKIE,'')
@@ -167,7 +173,7 @@ def create_app():
     def login(body:Login,req:Request):
         if not req.cookies.get(CSRF_COOKIE) or not secrets.compare_digest(req.cookies.get(CSRF_COOKIE,''), req.headers.get('X-CSRF-Token','')):
             fail('CSRF_INVALID','CSRF token required',403)
-        now=int(time.time());key=(client_ip(req),body.username.lower().strip())
+        now=int(time.time());prune_failed(now);key=(client_ip(req),body.username.lower().strip())
         attempts=[t for t in _failed.get(key,[]) if t>now-300]
         if len(attempts)>=5:
             audit(req,'auth.login','rate_limited',user=body.username);fail('RATE_LIMITED','Too many login attempts',429)
