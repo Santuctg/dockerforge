@@ -138,3 +138,16 @@ def test_backend_requirements():
     r = sh(f'backend_requirements "{sys.executable}" "{REPO / "backend" / "pyproject.toml"}"')
     assert r.returncode == 0, r.stderr
     assert r.stdout.split('\n')[:4] == ['fastapi>=0.110,<1', 'uvicorn>=0.27,<1', 'argon2-cffi>=23,<26', 'pydantic>=2,<3']
+
+
+UNINSTALL = REPO / 'installer' / 'uninstall.sh'
+
+
+def test_uninstall_help():
+    r = run_script(UNINSTALL, '--help')
+    assert r.returncode == 0
+    assert '--purge' in r.stdout
+
+
+def test_uninstall_unknown_option():
+    assert run_script(UNINSTALL, '--bogus').returncode == 2
