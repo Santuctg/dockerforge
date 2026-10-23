@@ -46,18 +46,13 @@ find_python() {
 
 # Create the service env file once; never touch an existing one (keeps the setup token).
 ensure_env_file() {
-  local path=$1 token
+  local path=$1 token tmp
   if [[ -e $path ]]; then echo kept; return 0; fi
-  token=$(openssl rand -hex 24)
-  (
-    umask 027
-    cat >"$path" <<EOF
-DOCKERFORGE_DB=/var/lib/dockerforge/dockerforge.db
-DOCKERFORGE_DOCKER_SOCKET=/var/run/docker.sock
-DOCKERFORGE_SETUP_TOKEN=$token
-EOF
-  )
-  chmod 0640 "$path"
+  token=$(openssl rand -hex 24) || return 1
+  [[ $token =~ ^[0-9a-f]{48}$ ]] || return 1
+  tmp=$(mktemp "$path.XXXXXX") || return 1
+  printf 'DOCKERFORGE_DB=/var/lib/dockerforge/dockerforge.db\nDOCKERFORGE_DOCKER_SOCKET=/var/run/docker.sock\nDOCKERFORGE_SETUP_TOKEN=%s\n' "$token" >"$tmp" || { rm -f "$tmp"; return 1; }
+  if ! { chmod 0640 "$tmp" && mv "$tmp" "$path"; }; then rm -f "$tmp"; return 1; fi
   echo created
 }
 

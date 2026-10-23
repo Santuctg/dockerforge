@@ -1,0 +1,6 @@
+[Unit]
+Description=Renew Let's Encrypt certificates (DockerForge)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/env certbot renew --quiet

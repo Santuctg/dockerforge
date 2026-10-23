@@ -7,7 +7,8 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 . "$ROOT/installer/lib.sh"
 
 UNITS=(dockerforge.service dockerforge-metrics.service dockerforge-backup.service dockerforge-backup.timer
-       dockerforge-data-backup.service dockerforge-data-backup.timer)
+       dockerforge-data-backup.service dockerforge-data-backup.timer
+       dockerforge-certbot-renew.service dockerforge-certbot-renew.timer)
 CLIS=(dockerforge-backup dockerforge-volume-backup volume-backup.py dockerforge-bind-backup
       dockerforge-data-backup dockerforge-tls-deploy)
 PURGE=0 ASSUME_YES=0

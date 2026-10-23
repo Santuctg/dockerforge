@@ -16,11 +16,13 @@ OS_RELEASE=${DOCKERFORGE_OS_RELEASE:-/etc/os-release}
 STAMP=$(date -u +%Y%m%dT%H%M%SZ)
 UNITS=(dockerforge.service dockerforge-metrics.service dockerforge-backup.service dockerforge-backup.timer
        dockerforge-data-backup.service dockerforge-data-backup.timer)
+# Firewall before TLS: certbot's standalone check needs port 80 already open.
 STEPS=(step_preflight step_packages step_docker step_user_dirs step_app
-       step_config step_tls step_services step_firewall step_verify)
+       step_config step_firewall step_tls step_services step_verify)
+SYSTEMD_DIR=/etc/systemd/system
 
 DOMAIN='' EMAIL='' ASSUME_YES=0 NO_FIREWALL=0 CHECK_ONLY=0
-FAMILY='' OS_ID='' PY='' BACKUP='' APP_SWAPPED=0 DONE=0
+FAMILY='' OS_ID='' PY='' BACKUP='' STAGING='' APP_SWAPPED=0 DONE=0
 
 usage() {
   cat <<'EOF'
@@ -57,6 +59,13 @@ parse_args() {
   fi
 }
 
+confirm() {
+  [[ $ASSUME_YES -eq 1 ]] && return 0
+  local reply=''
+  read -r -p "$1 [y/N] " reply </dev/tty || true
+  [[ $reply =~ ^[Yy] ]] || die "$2"
+}
+
 pkg_install() {
   case $FAMILY in
     debian) DEBIAN_FRONTEND=noninteractive apt-get install -y -q "$@" ;;
@@ -90,7 +99,9 @@ step_packages() {
       apt-get update -q
       base=(python3 python3-venv curl openssl ca-certificates iproute2) ;;
     rhel)
-      base=(python3 python3-pip curl openssl iproute hostname)
+      base=(python3 python3-pip openssl iproute hostname)
+      # EL9 ships curl-minimal, which conflicts with the curl package.
+      command -v curl >/dev/null 2>&1 || base+=(curl)
       if [[ -n $DOMAIN && $OS_ID != fedora ]]; then
         pkg_install epel-release || die 'certbot needs EPEL; enable the EPEL repository and re-run'
       fi ;;
@@ -110,32 +121,57 @@ step_packages() {
   echo "Python: $PY"
 }
 
-step_docker() {
-  if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
-    echo "Docker: $(docker --version)"
-  else
-    if [[ $ASSUME_YES -ne 1 ]]; then
-      local reply=''
-      read -r -p 'Docker (with Compose) is not installed. Install it now? [y/N] ' reply </dev/tty || true
-      [[ $reply =~ ^[Yy] ]] || die 'Docker is required. Install it, or re-run with --yes'
-    fi
-    if [[ $FAMILY == suse ]]; then
-      pkg_install docker docker-compose
-    else
+# How to install Docker Engine when it is missing: get.docker.com does not support Rocky/Alma/Oracle.
+docker_install_method() {
+  case $1 in
+    debian) echo get.docker.com ;;
+    rhel) if [[ $2 == fedora ]]; then echo get.docker.com; else echo docker-ce-repo; fi ;;
+    suse) echo zypper ;;
+  esac
+}
+
+install_docker_engine() {
+  case $(docker_install_method "$FAMILY" "$OS_ID") in
+    get.docker.com)
       local script
       script=$(mktemp)
       curl -fsSL https://get.docker.com -o "$script"
-      sh "$script" || die 'Docker install failed; install Docker Engine manually (docs.docker.com/engine/install) and re-run'
-      rm -f "$script"
-    fi
+      sh "$script" || { rm -f "$script"; die 'Docker install failed; install Docker Engine manually (docs.docker.com/engine/install) and re-run'; }
+      rm -f "$script" ;;
+    docker-ce-repo)
+      pkg_install dnf-plugins-core
+      dnf config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
+      pkg_install docker-ce docker-ce-cli containerd.io docker-compose-plugin ;;
+    zypper)
+      pkg_install docker docker-compose ;;
+  esac
+}
+
+# Existing engine without Compose: add only the plugin, never reinstall the engine under running containers.
+install_compose_plugin() {
+  case $FAMILY in
+    debian) pkg_install docker-compose-plugin || pkg_install docker-compose-v2 ;;
+    rhel) pkg_install docker-compose-plugin ;;
+    suse) pkg_install docker-compose ;;
+  esac
+}
+
+step_docker() {
+  if ! command -v docker >/dev/null 2>&1; then
+    confirm 'Docker is not installed. Install Docker Engine with Compose now?' 'Docker is required. Install it, or re-run with --yes'
+    install_docker_engine
+  elif ! docker compose version >/dev/null 2>&1; then
+    confirm 'Docker is installed but the Compose plugin is missing. Install the plugin now?' 'Docker Compose is required. Install it, or re-run with --yes'
+    install_compose_plugin
   fi
   systemctl enable --now docker
   docker compose version >/dev/null 2>&1 || die 'Docker Compose plugin is missing (docker compose)'
+  echo "Docker: $(docker --version)"
 }
 
 step_user_dirs() {
   if ! getent passwd dockerforge >/dev/null; then
-    useradd --system --home-dir "$DATA" --no-create-home --shell "$(command -v nologin || echo /bin/false)" dockerforge
+    useradd --system --user-group --home-dir "$DATA" --no-create-home --shell "$(command -v nologin || echo /bin/false)" dockerforge
   fi
   # Docker group access is root-equivalent; see SECURITY.md.
   usermod -aG docker dockerforge
@@ -167,11 +203,18 @@ PY
   echo "Previous install backed up to $BACKUP"
 }
 
+# Copy the backend owned by root (not the git checkout's user) and without tests or caches.
+stage_backend() {
+  mkdir -m 0755 "$2"
+  tar -C "$1" --exclude=./tests --exclude=.pytest_cache --exclude=__pycache__ -cf - . | tar -C "$2" --no-same-owner -xf -
+  if [[ $(id -u) -eq 0 ]]; then chown -R root:root "$2"; fi
+}
+
 step_app() {
   [[ -f $APP/app/core.py ]] && backup_existing
-  local staging=/opt/dockerforge/.staging-$STAMP
-  mkdir -m 0755 "$staging"
-  cp -a "$ROOT/backend/." "$staging/"
+  STAGING=/opt/dockerforge/.staging-$STAMP
+  local staging=$STAGING
+  stage_backend "$ROOT/backend" "$staging"
   "$PY" -m compileall -q "$staging/app"
   [[ -x $VENV/bin/python ]] || "$PY" -m venv "$VENV"
   local reqs
@@ -186,7 +229,8 @@ step_app() {
 }
 
 step_config() {
-  echo "Env file: $(ensure_env_file "$ENV_FILE")"
+  printf 'Env file: '
+  ensure_env_file "$ENV_FILE" || die "Could not create $ENV_FILE"
   chown root:dockerforge "$ENV_FILE"
   if [[ ! -e $CONF/data-backup.json ]]; then
     install -m 0600 "$ROOT/data-backup.example.json" "$CONF/data-backup.json"
@@ -199,7 +243,7 @@ step_tls() {
     certbot certonly --standalone --non-interactive --agree-tos --keep-until-expiring \
       -m "$EMAIL" -d "$DOMAIN" --deploy-hook /usr/local/sbin/dockerforge-tls-deploy
     RENEWED_LINEAGE=/etc/letsencrypt/live/$DOMAIN /usr/local/sbin/dockerforge-tls-deploy
-    systemctl enable --now certbot.timer 2>/dev/null || systemctl enable --now certbot-renew.timer 2>/dev/null || true
+    ensure_renew_timer
     echo "Let's Encrypt certificate installed for $DOMAIN"
   elif [[ ! -f $TLS/fullchain.pem ]]; then
     local host ip
@@ -214,6 +258,24 @@ step_tls() {
   else
     echo 'Existing certificate kept'
   fi
+}
+
+# Use the distro's certbot timer if it ships one, otherwise install our own.
+ensure_renew_timer() {
+  local listed timer
+  listed=$(systemctl list-unit-files --no-legend 'certbot*.timer' 'snap.certbot*.timer' 2>/dev/null || true)
+  for timer in certbot.timer certbot-renew.timer snap.certbot.renew.timer; do
+    if awk -v t="$timer" '$1 == t {found=1} END {exit !found}' <<<"$listed"; then
+      systemctl enable --now "$timer"
+      echo "Certificate renewal: $timer"
+      return 0
+    fi
+  done
+  install -m 0644 "$ROOT/systemd/dockerforge-certbot-renew.service" "$SYSTEMD_DIR/dockerforge-certbot-renew.service"
+  install -m 0644 "$ROOT/systemd/dockerforge-certbot-renew.timer" "$SYSTEMD_DIR/dockerforge-certbot-renew.timer"
+  systemctl daemon-reload
+  systemctl enable --now dockerforge-certbot-renew.timer
+  echo 'Certificate renewal: dockerforge-certbot-renew.timer'
 }
 
 step_services() {
@@ -270,7 +332,8 @@ step_verify() {
 
 rollback() {
   echo 'Install failed.' >&2
-  if [[ -n $BACKUP && -d $BACKUP/backend ]]; then
+  if [[ -n $STAGING && -d $STAGING ]]; then rm -rf "$STAGING"; fi
+  if [[ $APP_SWAPPED -eq 1 && -n $BACKUP && -d $BACKUP/backend ]]; then
     echo 'Restoring previous version...' >&2
     rm -rf "$APP"
     cp -a "$BACKUP/backend" "$APP"
@@ -281,6 +344,8 @@ rollback() {
   elif [[ $APP_SWAPPED -eq 1 ]]; then
     systemctl stop dockerforge dockerforge-metrics 2>/dev/null || true
     echo 'New services stopped; files left in place for inspection.' >&2
+  elif [[ -n $BACKUP ]]; then
+    echo "The running install was not changed. Backup kept at: $BACKUP" >&2
   fi
 }
 

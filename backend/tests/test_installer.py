@@ -96,7 +96,7 @@ def test_tls_hook_requires_lineage():
 
 INSTALL = REPO / 'installer' / 'install.sh'
 STEP_NAMES = ['step_preflight', 'step_packages', 'step_docker', 'step_user_dirs', 'step_app',
-              'step_config', 'step_tls', 'step_services', 'step_firewall', 'step_verify']
+              'step_config', 'step_firewall', 'step_tls', 'step_services', 'step_verify']
 
 
 def run_script(path, *args, env=None):
@@ -151,3 +151,127 @@ def test_uninstall_help():
 
 def test_uninstall_unknown_option():
     assert run_script(UNINSTALL, '--bogus').returncode == 2
+
+
+# --- final review fixes: install.sh functions run against stubbed system commands ---
+
+def run_install_fn(tmp_path, body, stubs=None):
+    """Source install.sh, override system commands with recording stubs, run body."""
+    bindir = tmp_path / 'bin'
+    bindir.mkdir(exist_ok=True)
+    log = tmp_path / 'calls.log'
+    for name, code in (stubs or {}).items():
+        stub = bindir / name
+        stub.write_text(f'#!/bin/bash\necho "{name} $*" >> "{log}"\n{code}\n')
+        stub.chmod(0o755)
+    script = (f'source "{INSTALL}" --source-only; set +e; '
+              f'pkg_install() {{ echo "pkg_install $*" >> "{log}"; }}; '
+              f'PATH="{bindir}:$PATH"; {body}')
+    r = subprocess.run(['bash', '-c', script], capture_output=True, text=True)
+    return r, (log.read_text() if log.exists() else '')
+
+
+def test_firewall_runs_before_tls():
+    r = subprocess.run(['bash', '-c', f'source "{INSTALL}" --source-only; printf "%s\\n" "${{STEPS[@]}}"'],
+                       capture_output=True, text=True)
+    steps = r.stdout.split()
+    assert steps.index('step_firewall') < steps.index('step_tls')
+
+
+def test_docker_install_method():
+    cases = [('debian', 'ubuntu', 'get.docker.com'), ('rhel', 'fedora', 'get.docker.com'),
+             ('rhel', 'rocky', 'docker-ce-repo'), ('rhel', 'almalinux', 'docker-ce-repo'),
+             ('rhel', 'rhel', 'docker-ce-repo'), ('suse', 'opensuse-leap', 'zypper')]
+    for family, os_id, method in cases:
+        r = subprocess.run(['bash', '-c', f'source "{INSTALL}" --source-only; docker_install_method {family} {os_id}'],
+                           capture_output=True, text=True)
+        assert r.stdout.strip() == method, (family, os_id, r.stderr)
+
+
+def test_existing_docker_gets_only_compose_plugin(tmp_path):
+    r, calls = run_install_fn(tmp_path, 'FAMILY=debian; OS_ID=ubuntu; ASSUME_YES=1; step_docker',
+                              {'docker': '[[ "$1" == compose ]] && exit 1; exit 0',
+                               'curl': 'exit 0', 'systemctl': 'exit 0'})
+    assert 'pkg_install docker-compose-plugin' in calls or 'pkg_install docker-compose-v2' in calls
+    assert 'curl ' not in calls
+
+
+def test_renew_timer_installed_when_distro_has_none(tmp_path):
+    unit_dir = tmp_path / 'units'
+    unit_dir.mkdir()
+    r, calls = run_install_fn(tmp_path, f'SYSTEMD_DIR="{unit_dir}"; ensure_renew_timer',
+                              {'systemctl': '[[ "$1" == list-unit-files ]] && exit 0; exit 0'})
+    assert r.returncode == 0, r.stderr
+    assert (unit_dir / 'dockerforge-certbot-renew.timer').is_file()
+    assert 'certbot renew' in (unit_dir / 'dockerforge-certbot-renew.service').read_text()
+    assert 'systemctl enable --now dockerforge-certbot-renew.timer' in calls
+
+
+def test_renew_timer_uses_distro_timer(tmp_path):
+    unit_dir = tmp_path / 'units'
+    unit_dir.mkdir()
+    r, calls = run_install_fn(tmp_path, f'SYSTEMD_DIR="{unit_dir}"; ensure_renew_timer',
+                              {'systemctl': '[[ "$1" == list-unit-files ]] && { echo "certbot-renew.timer disabled enabled"; exit 0; }; exit 0'})
+    assert 'systemctl enable --now certbot-renew.timer' in calls
+    assert not (unit_dir / 'dockerforge-certbot-renew.timer').exists()
+
+
+def test_stage_backend_excludes_tests_and_caches(tmp_path):
+    src = tmp_path / 'src'
+    (src / 'app' / '__pycache__').mkdir(parents=True)
+    (src / 'app' / 'core.py').write_text('x')
+    (src / 'app' / '__pycache__' / 'core.pyc').write_text('x')
+    (src / 'tests').mkdir()
+    (src / '.pytest_cache').mkdir()
+    (src / 'pyproject.toml').write_text('x')
+    dest = tmp_path / 'dest'
+    r = subprocess.run(['bash', '-c', f'source "{INSTALL}" --source-only; stage_backend "{src}" "{dest}"'],
+                       capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    assert (dest / 'app' / 'core.py').is_file() and (dest / 'pyproject.toml').is_file()
+    assert not (dest / 'tests').exists() and not (dest / '.pytest_cache').exists()
+    assert not (dest / 'app' / '__pycache__').exists()
+    if os.geteuid() == 0:
+        assert all(p.stat().st_uid == 0 for p in [dest, *dest.rglob('*')])
+
+
+def test_rhel_skips_curl_when_present(tmp_path):
+    r, calls = run_install_fn(tmp_path, 'FAMILY=rhel; OS_ID=rocky; DOMAIN=; find_python() { echo /usr/bin/python3; }; step_packages',
+                              {'curl': 'exit 0'})
+    line = next(l for l in calls.splitlines() if l.startswith('pkg_install'))
+    assert 'curl' not in line.split()
+
+
+def test_rollback_before_swap_leaves_live_code(tmp_path):
+    app = tmp_path / 'live'
+    app.mkdir()
+    (app / 'marker').write_text('live')
+    backup = tmp_path / 'backup'
+    (backup / 'backend').mkdir(parents=True)
+    r, calls = run_install_fn(tmp_path, f'APP="{app}"; BACKUP="{backup}"; APP_SWAPPED=0; rollback',
+                              {'systemctl': 'exit 0'})
+    assert (app / 'marker').read_text() == 'live'
+    assert 'systemctl restart' not in calls
+
+
+def test_step_config_fails_when_token_generation_fails(tmp_path):
+    bindir = tmp_path / 'bin'
+    bindir.mkdir()
+    (bindir / 'openssl').write_text('#!/bin/sh\nexit 1\n')
+    (bindir / 'openssl').chmod(0o755)
+    conf = tmp_path / 'conf'
+    conf.mkdir()
+    (conf / 'data-backup.json').write_text('{}')
+    env = conf / 'dockerforge.env'
+    script = (f'source "{INSTALL}" --source-only; PATH="{bindir}:$PATH"; CONF="{conf}"; '
+              f'ENV_FILE="{env}"; chown() {{ :; }}; step_config')
+    r = subprocess.run(['bash', '-c', script], capture_output=True, text=True)
+    assert r.returncode != 0
+    assert not env.exists()
+
+
+def test_service_user_gets_own_group(tmp_path):
+    r, calls = run_install_fn(tmp_path, 'install() { :; }; step_user_dirs',
+                              {'getent': 'exit 2', 'useradd': 'exit 0', 'usermod': 'exit 0'})
+    useradd = next(l for l in calls.splitlines() if l.startswith('useradd'))
+    assert '--user-group' in useradd.split() or '-U' in useradd.split()
