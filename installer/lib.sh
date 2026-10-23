@@ -60,3 +60,24 @@ EOF
   chmod 0640 "$path"
   echo created
 }
+
+# Print the backend's runtime dependencies, one per line (python >= 3.11 has tomllib).
+backend_requirements() {
+  "$1" - "$2" <<'PY'
+import sys, tomllib
+with open(sys.argv[1], 'rb') as f:
+    print('\n'.join(tomllib.load(f)['project']['dependencies']))
+PY
+}
+
+# Best-effort primary IPv4 address, used for the self-signed SAN and the printed URL.
+primary_ip() {
+  local ip
+  ip=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}') || true
+  echo "${ip:-127.0.0.1}"
+}
+
+port_in_use() {
+  command -v ss >/dev/null 2>&1 || return 1
+  [[ -n $(ss -ltnH "sport = :$1" 2>/dev/null) ]]
+}

@@ -92,3 +92,49 @@ def test_tls_hook_requires_lineage():
     r = subprocess.run(['bash', str(REPO / 'installer' / 'tls-deploy-hook.sh')],
                        capture_output=True, text=True, env=env)
     assert r.returncode == 1
+
+
+INSTALL = REPO / 'installer' / 'install.sh'
+STEP_NAMES = ['step_preflight', 'step_packages', 'step_docker', 'step_user_dirs', 'step_app',
+              'step_config', 'step_tls', 'step_services', 'step_firewall', 'step_verify']
+
+
+def run_script(path, *args, env=None):
+    return subprocess.run(['bash', str(path), *args], capture_output=True, text=True,
+                          env={**os.environ, **(env or {})})
+
+
+def test_install_help():
+    r = run_script(INSTALL, '--help')
+    assert r.returncode == 0
+    assert '--domain' in r.stdout and '--check' in r.stdout
+
+
+def test_install_domain_requires_email():
+    r = run_script(INSTALL, '--domain', 'x.example.com')
+    assert r.returncode == 2
+    assert '--email is required' in r.stderr
+
+
+def test_install_unknown_option():
+    assert run_script(INSTALL, '--bogus').returncode == 2
+
+
+def test_install_step_order():
+    r = subprocess.run(['bash', '-c', f'source "{INSTALL}" --source-only; printf "%s\\n" "${{STEPS[@]}}"'],
+                       capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.split() == STEP_NAMES
+
+
+def test_install_check_unsupported(tmp_path):
+    arch = os_release(tmp_path, 'ID=arch\n')
+    r = run_script(INSTALL, '--check', env={'DOCKERFORGE_OS_RELEASE': str(arch)})
+    assert r.returncode == 1
+    assert 'Unsupported distribution' in r.stderr
+
+
+def test_backend_requirements():
+    r = sh(f'backend_requirements "{sys.executable}" "{REPO / "backend" / "pyproject.toml"}"')
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.split('\n')[:4] == ['fastapi>=0.110,<1', 'uvicorn>=0.27,<1', 'argon2-cffi>=23,<26', 'pydantic>=2,<3']
