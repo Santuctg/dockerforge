@@ -102,3 +102,16 @@ def test_prune_failed_caps_keys_keeping_newest():
     core.prune_failed(1000, cap=3)
     assert set(core._failed) == {('ip', 'u2'), ('ip', 'u3'), ('ip', 'u4')}
     core._failed.clear()
+
+
+SECURITY_HEADERS = {'x-frame-options': 'DENY', 'referrer-policy': 'no-referrer',
+                    'strict-transport-security': 'max-age=31536000'}
+
+
+def test_security_headers_on_success_and_error(make_client):
+    super_client, _ = make_client
+    anonymous = TestClient(super_client.app, base_url='https://testserver')
+    for response in (anonymous.get('/health'), anonymous.get('/api/v1/auth/session')):
+        for name, value in SECURITY_HEADERS.items():
+            assert response.headers.get(name) == value, (response.status_code, name)
+    assert anonymous.get('/api/v1/auth/session').status_code == 401

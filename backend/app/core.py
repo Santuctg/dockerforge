@@ -134,6 +134,9 @@ def create_app():
         res.headers['X-Request-ID']=rid
         res.headers['Cache-Control']='no-store'
         res.headers['X-Content-Type-Options']='nosniff'
+        res.headers['X-Frame-Options']='DENY'
+        res.headers['Referrer-Policy']='no-referrer'
+        res.headers['Strict-Transport-Security']='max-age=31536000'
         return res
     @app.exception_handler(HTTPException)
     async def http_error(req,exc):
