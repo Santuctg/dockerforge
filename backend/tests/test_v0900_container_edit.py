@@ -434,3 +434,27 @@ def test_live_edits_call_docker(api):
     assert admin.post('/api/v1/containers/web2/networks/backend/disconnect').status_code == 200
     assert ('disconnect', 'backend', 'web2') in docker.calls
     assert admin.post('/api/v1/containers/web2/networks/host/connect').status_code == 422
+
+
+# --- Task 5: UI ---
+from app.ui import HTML
+
+
+def test_ui_has_edit_tab_gated_for_admins():
+    assert "['overview','configuration','network','mounts','logs','stats','console','edit','raw']" in HTML
+    assert "if(!canAdmin())content.textContent='Admin permission required.';else await setupEditWorkspace(content,id,name);" in HTML
+
+
+def test_ui_edit_functions_and_endpoints():
+    for fn in ('setupEditWorkspace', 'saveResources', 'renameContainer', 'recreateContainer', 'rollbackContainer',
+               'removeBackup', 'parsePortLines'):
+        assert f'function {fn}(' in HTML, fn
+    for path in ("'/edit'", "'/resources'", "'/rename'", "'/recreate'", "'/rollback'", "'/backup'", "'/networks/'"):
+        assert path in HTML, path
+    assert 'Managed by Compose stack ' in HTML
+
+
+def test_ui_edit_workspace_uses_text_content_only():
+    start = HTML.index('function setupEditWorkspace(')
+    end = HTML.index('\n', HTML.index('async function removeBackup('))
+    assert 'innerHTML' not in HTML[start:end]

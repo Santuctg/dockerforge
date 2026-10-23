@@ -241,6 +241,55 @@ function setupConsoleWorkspace(content,id){
  controls.append(field,historySelect,run,makeToolButton('Clear output',()=>{output.textContent='';status.textContent='Output cleared'}),makeToolButton('Copy output',async()=>{try{await navigator.clipboard.writeText(output.textContent);status.textContent='Output copied'}catch(e){status.textContent='Clipboard permission unavailable'}}));
  content.append(info,controls,status,output);
 }
+function editEl(tag,props={},children=[]){const el=document.createElement(tag);Object.assign(el,props);el.append(...children);return el}
+function editField(label,input){return editEl('label',{className:'edit-field'},[editEl('span',{textContent:label}),input])}
+function parsePortLines(text){const out=[];for(const raw of text.split(String.fromCharCode(10))){const line=raw.trim();if(!line)continue;const [spec,proto='tcp']=line.split('/');const parts=spec.split(':');if(parts.length<2||parts.length>3)throw Error('Port lines look like 8080:80 or 127.0.0.1:8080:80/udp');const host_ip=parts.length===3?parts[0]:'127.0.0.1';const host_port=Number(parts[parts.length-2]);const container_port=Number(parts[parts.length-1]);if(!Number.isInteger(host_port)||!Number.isInteger(container_port))throw Error('Invalid port line: '+line);out.push({host_ip,host_port,container_port,protocol:proto})}return out}
+function editLines(text){return text.split(String.fromCharCode(10)).map(l=>l.trim()).filter(Boolean)}
+async function saveResources(id,values){return call('containers/'+encodeURIComponent(id)+'/resources','POST',values)}
+async function renameContainer(id,newName){return call('containers/'+encodeURIComponent(id)+'/rename','POST',{name:newName})}
+async function recreateContainer(id,body){return call('containers/'+encodeURIComponent(id)+'/recreate','POST',body)}
+async function rollbackContainer(id){return call('containers/'+encodeURIComponent(id)+'/rollback','POST',{})}
+async function setupEditWorkspace(content,id,name){
+ const spec=await call('containers/'+encodeURIComponent(id)+'/edit');content.replaceChildren();
+ const status=editEl('p',{className:'tool-status'});status.setAttribute('aria-live','polite');
+ const done=async(message,newId,newName)=>{status.textContent=message;try{await listContainers()}catch(e){}viewContainerDetails(newId||id,newName||name,'','edit')};
+ const guard=fn=>async()=>{status.textContent='Working…';try{await fn()}catch(e){status.textContent=e.message}};
+ const memory=editEl('input',{type:'number',min:16,placeholder:'MiB (empty = keep)',value:spec.memory_mb??''});
+ const cpus=editEl('input',{type:'number',min:0.01,step:0.01,placeholder:'CPU cores (empty = keep)',value:spec.nano_cpus?spec.nano_cpus/1e9:''});
+ const restart=editEl('select',{},['no','always','unless-stopped','on-failure'].map(v=>editEl('option',{value:v,textContent:v,selected:v===spec.restart})));
+ const live=()=>({memory_mb:memory.value?Number(memory.value):null,nano_cpus:cpus.value?Math.round(Number(cpus.value)*1e9):null,restart:restart.value});
+ const newName=editEl('input',{value:spec.name});const network=editEl('input',{placeholder:'network name'});
+ content.append(editEl('h4',{textContent:'Live settings (no restart)'}),editField('Memory limit',memory),editField('CPU limit',cpus),editField('Restart policy',restart),
+  makeToolButton('Save live settings',guard(async()=>{await saveResources(id,live());await done('Live settings saved')})),
+  editField('Name',newName),makeToolButton('Rename',guard(async()=>{const r=await renameContainer(id,newName.value.trim());await done('Renamed',id,r.name)})),
+  editField('Network',network),
+  makeToolButton('Connect',guard(async()=>{await call('containers/'+encodeURIComponent(id)+'/networks/'+encodeURIComponent(network.value.trim())+'/connect','POST',{});await done('Connected to '+network.value.trim())})),
+  makeToolButton('Disconnect',guard(async()=>{await call('containers/'+encodeURIComponent(id)+'/networks/'+encodeURIComponent(network.value.trim())+'/disconnect','POST',{});await done('Disconnected from '+network.value.trim())})));
+ content.append(editEl('h4',{textContent:'Edit & recreate'}));
+ if(spec.compose_project){
+  content.append(editEl('p',{className:'hint',textContent:'Managed by Compose stack '+spec.compose_project+'. Edit the stack instead, so the next deploy keeps your changes.'}),makeToolButton('Open Compose stacks',()=>navigate('compose')));
+ }else{
+  const image=editEl('input',{value:spec.image||''});
+  const command=editEl('input',{placeholder:'empty = image default',value:spec.command?spec.command.join(' '):''});
+  const env=editEl('textarea',{rows:4,value:Object.entries(spec.environment||{}).map(([k,v])=>k+'='+v).join(String.fromCharCode(10))});
+  const ports=editEl('textarea',{rows:3,placeholder:'8080:80 or 0.0.0.0:443:443/tcp',value:(spec.port_bindings||[]).map(p=>p.host_ip+':'+p.host_port+':'+p.container_port+'/'+p.protocol).join(String.fromCharCode(10))});
+  const mounts=editEl('textarea',{rows:3,placeholder:'/host/path:/container/path or volume:/path[:ro]',value:(spec.mounts||[]).join(String.fromCharCode(10))});
+  const ackRisk=editEl('input',{type:'checkbox'});const ackPublic=editEl('input',{type:'checkbox'});
+  const body=pull=>{const environment={};for(const line of editLines(env.value)){const i=line.indexOf('=');if(i<1)throw Error('Environment lines must be KEY=value');environment[line.slice(0,i)]=line.slice(i+1)}
+   const cmd=command.value.trim();return {image:image.value.trim(),command:cmd?cmd.split(' ').filter(Boolean):null,environment,port_bindings:parsePortLines(ports.value),mounts:editLines(mounts.value),...live(),restart:restart.value,pull,acknowledge_high_risk:ackRisk.checked,acknowledge_public_ports:ackPublic.checked}};
+  const run=pull=>guard(async()=>{if(!confirm('Recreate '+name+'? It will be stopped and replaced; the old container is kept as a backup.'))return;status.textContent='Recreating…';const r=await recreateContainer(id,body(pull));await done('Recreated; backup '+r.backup,r.id,r.name)});
+  content.append(editField('Image',image),editField('Command',command),editField('Environment (KEY=value per line)',env),editField('Ports',ports),editField('Mounts',mounts),
+   editField('I accept host-level risk (bind mounts, privileged, host network)',ackRisk),editField('I accept exposing ports beyond localhost',ackPublic),
+   makeToolButton('Save & recreate',run(false)),makeToolButton('Update image (pull & recreate)',run(true)));
+ }
+ if(spec.backup){
+  content.append(editEl('h4',{textContent:'Backup'}),editEl('p',{textContent:'Previous container: '+spec.backup.old_name+' ('+new Date(spec.backup.created_at*1000).toLocaleString()+')'}),
+   makeToolButton('Roll back',guard(async()=>{if(!confirm('Replace the current container with the backup?'))return;const r=await rollbackContainer(id);await done('Rolled back',r.id,r.name)})),
+   makeToolButton('Remove backup',guard(async()=>{if(!confirm('Delete the backup container? Volumes are kept.'))return;await removeBackup(id);await done('Backup removed')})));
+ }
+ content.append(status);
+}
+async function removeBackup(id){return call('containers/'+encodeURIComponent(id)+'/backup','DELETE')}
 let detailsFullscreen=false;document.addEventListener('keydown',event=>{if(event.key==='Escape'&&detailsFullscreen){detailsFullscreen=false;document.querySelector('#containerDetailPanel')?.classList.remove('fullscreen-details')}});
 async function viewContainerDetails(id,name,state,tab='overview'){
  const panel=document.querySelector('#containerDetailPanel');panel.hidden=false;panel.replaceChildren();
@@ -251,7 +300,7 @@ async function viewContainerDetails(id,name,state,tab='overview'){
  header.append(heading,maximize,close);panel.append(header);
  const tabs=document.createElement('div');tabs.className='detail-tabs';tabs.setAttribute('role','tablist');
  const content=document.createElement('div');content.className='detail-content';content.setAttribute('aria-live','polite');content.textContent='Loading…';
- for(const type of ['overview','configuration','network','mounts','logs','stats','console','raw']){
+ for(const type of ['overview','configuration','network','mounts','logs','stats','console','edit','raw']){
   const button=document.createElement('button');button.type='button';button.textContent=type==='raw'?'Raw JSON':type[0].toUpperCase()+type.slice(1);
   button.className=type===tab?'primary-action':'';button.setAttribute('role','tab');button.setAttribute('aria-selected',String(type===tab));
   button.onclick=()=>viewContainerDetails(id,name,state,type);tabs.append(button);
@@ -265,6 +314,8 @@ async function viewContainerDetails(id,name,state,tab='overview'){
   }else if(tab==='stats'){
    const value=await call('containers/'+encodeURIComponent(id)+'/metrics');content.replaceChildren();
    content.append(detailsGroup('Live statistics',[['CPU',String(value.cpu_percent??'—')+'%'],['Memory',bytesHuman(value.memory_usage_bytes)],['Memory percent',String(value.memory_percent??'—')+'%'],['Network RX',String(value.network_rx_bytes??'—')+' bytes'],['Network TX',String(value.network_tx_bytes??'—')+' bytes']]));
+  }else if(tab==='edit'){
+   if(!canAdmin())content.textContent='Admin permission required.';else await setupEditWorkspace(content,id,name);
   }else if(tab==='console'){
    if(!canOperate())content.textContent='Operator permission required.';else setupConsoleWorkspace(content,id);
   }
