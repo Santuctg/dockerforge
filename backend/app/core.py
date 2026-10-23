@@ -22,6 +22,11 @@ ADMINS = {'super_admin','admin'}
 _ph = PasswordHasher()
 _init_lock = Lock()
 _failed = {}
+_failed_ip = {}
+_failed_lock = Lock()
+FAILED_CAP = 10000
+# Failures per client IP across all usernames; also stops key floods from evicting a lockout.
+IP_FAILURE_LIMIT = 30
 
 def conn():
     Path(os.environ.get('DOCKERFORGE_DB',DB)).parent.mkdir(parents=True,exist_ok=True)
@@ -49,6 +54,16 @@ def redact(value):
 def audit(req, action, result='success', user=None, resource=None, metadata=None):
     with conn() as db:
         db.execute('INSERT INTO audit(ts,actor,action,resource,ip,result,request_id,metadata) VALUES(?,?,?,?,?,?,?,?)',(int(time.time()),user,action,resource,client_ip(req),result,getattr(req.state,'request_id',''),json.dumps(redact(metadata or {}))))
+
+def prune_failed(now,cap=None):
+    cap=FAILED_CAP if cap is None else cap
+    # Keep login rate-limit state bounded: forget expired keys, then cap by most recent attempt.
+    # Caller holds _failed_lock.
+    for store in (_failed,_failed_ip):
+        for key in [k for k,v in store.items() if not any(t>now-300 for t in v)]:store.pop(key,None)
+    if len(_failed)>cap:
+        # Evict keys with the fewest recent failures first, so a flood of junk usernames cannot clear a real lockout.
+        for key in sorted(_failed,key=lambda k:(len(_failed[k]),max(_failed[k])))[:len(_failed)-cap]:_failed.pop(key,None)
 
 def fail(code,message,status):raise HTTPException(status_code=status,detail={'code':code,'message':message})
 def user_from_session(req):
@@ -105,6 +120,13 @@ class DeleteConfirmation(BaseModel):
     force:bool=False
     remove_volumes:bool=False
 
+def redact_env(details):
+    # Env values often hold passwords/tokens; keep only variable names for non-admins.
+    config=details.get('Config') if isinstance(details,dict) else None
+    if not isinstance(config,dict) or not isinstance(config.get('Env'),list):return details
+    env=[e.split('=',1)[0]+'=[REDACTED]' if isinstance(e,str) and '=' in e else e for e in config['Env']]
+    return {**details,'Config':{**config,'Env':env}}
+
 def provider():return LocalDockerProvider(os.environ.get('DOCKERFORGE_DOCKER_SOCKET','/var/run/docker.sock'))
 
 def create_app():
@@ -121,6 +143,9 @@ def create_app():
         res.headers['X-Request-ID']=rid
         res.headers['Cache-Control']='no-store'
         res.headers['X-Content-Type-Options']='nosniff'
+        res.headers['X-Frame-Options']='DENY'
+        res.headers['Referrer-Policy']='no-referrer'
+        res.headers['Strict-Transport-Security']='max-age=31536000'
         return res
     @app.exception_handler(HTTPException)
     async def http_error(req,exc):
@@ -160,9 +185,12 @@ def create_app():
     def login(body:Login,req:Request):
         if not req.cookies.get(CSRF_COOKIE) or not secrets.compare_digest(req.cookies.get(CSRF_COOKIE,''), req.headers.get('X-CSRF-Token','')):
             fail('CSRF_INVALID','CSRF token required',403)
-        now=int(time.time());key=(client_ip(req),body.username.lower().strip())
-        attempts=[t for t in _failed.get(key,[]) if t>now-300]
-        if len(attempts)>=5:
+        now=int(time.time());ip=client_ip(req);key=(ip,body.username.lower().strip())
+        with _failed_lock:
+            prune_failed(now)
+            attempts=[t for t in _failed.get(key,[]) if t>now-300]
+            ip_attempts=[t for t in _failed_ip.get(ip,[]) if t>now-300]
+        if len(attempts)>=5 or len(ip_attempts)>=IP_FAILURE_LIMIT:
             audit(req,'auth.login','rate_limited',user=body.username);fail('RATE_LIMITED','Too many login attempts',429)
         with conn() as db:r=db.execute('SELECT * FROM users WHERE username=?',(body.username,)).fetchone()
         good=False
@@ -170,8 +198,10 @@ def create_app():
             try:good=_ph.verify(r['password_hash'],body.password)
             except Exception:pass
         if not good:
-            _failed[key]=attempts+[now];audit(req,'auth.login','denied',user=body.username);fail('LOGIN_FAILED','Invalid credentials',401)
-        _failed.pop(key,None)
+            with _failed_lock:
+                _failed.setdefault(key,[]).append(now);_failed_ip.setdefault(ip,[]).append(now)
+            audit(req,'auth.login','denied',user=body.username);fail('LOGIN_FAILED','Invalid credentials',401)
+        with _failed_lock:_failed.pop(key,None)
         token=secrets.token_urlsafe(48);csrf=secrets.token_urlsafe(32)
         with conn() as db:db.execute('INSERT INTO sessions VALUES(?,?,?,?,?,?)',(digest(token),r['id'],digest(csrf),now,now,now+86400))
         res=JSONResponse({'username':r['username'],'role':r['role'],'csrf_token':csrf})
@@ -376,7 +406,8 @@ def create_app():
         return result
 
     @app.get('/api/v1/containers/{ident}/logs')
-    def container_logs(ident:str,tail:int=100,timestamps:bool=False,user=Depends(require_role(READ))):
+    def container_logs(ident:str,tail:int=100,timestamps:bool=False,user=Depends(require_role(OPS))):
+        # Logs routinely contain credentials; viewers get status and metrics only.
         try:return fetch_logs(ident,tail,timestamps)
         except ValueError:fail('INVALID_REQUEST','Invalid container or tail count',422)
         except RuntimeError:fail('DOCKER_LOGS_FAILED','Unable to retrieve container logs',502)
@@ -402,7 +433,9 @@ def create_app():
 
     @app.get('/api/v1/containers/{ident}')
     def inspect_container(ident:str,user=Depends(require_role(READ))):
-        try:return provider().inspect_container(valid_id(ident))
+        try:
+            details=provider().inspect_container(valid_id(ident))
+            return details if user['role'] in ADMINS else redact_env(details)
         except DockerOperationError as exc:fail(exc.code,str(exc),exc.status_code)
         except ValueError:fail('INVALID_CONTAINER','Invalid container identifier',422)
 

@@ -2,6 +2,8 @@
 set -Eeuo pipefail
 [[ $(id -u) -eq 0 ]] || { echo 'Must run as root' >&2; exit 1; }
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# shellcheck source=installer/lib.sh
+. "$ROOT/installer/lib.sh"
 APP=/opt/dockerforge/backend
 [[ -f "$APP/app/core.py" && -f /etc/dockerforge/dockerforge.env ]] || { echo 'Existing Task 1-5 foundation not detected; refusing update' >&2; exit 1; }
 command -v python3 >/dev/null
@@ -46,8 +48,7 @@ PYMETRICS
   chmod 0600 "$METRICS_BACKUP"
 fi
 STAGING=/opt/dockerforge/.v0700-staging-$STAMP
-mkdir -m 0755 "$STAGING"
-cp -a "$ROOT/backend/." "$STAGING/"
+stage_backend "$ROOT/backend" "$STAGING"
 /opt/dockerforge/venv/bin/python -m compileall -q "$STAGING/app"
 rollback() {
   echo 'Upgrade failed, restoring previous backend...' >&2
@@ -82,7 +83,7 @@ install -m 0644 "$ROOT/systemd/dockerforge-backup.timer" /etc/systemd/system/doc
 systemctl daemon-reload
 systemctl start dockerforge
 systemctl enable --now dockerforge-metrics
-for i in {1..15}; do
+for _ in {1..15}; do
  if curl -kfsS --silent --max-time 2 https://127.0.0.1:9443/health 2>/dev/null | grep -q '"status":"ok"'; then
    systemctl is-active --quiet dockerforge-metrics || { echo "Collector inactive" >&2; false; }
    trap - ERR

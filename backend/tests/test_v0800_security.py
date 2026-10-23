@@ -1,0 +1,143 @@
+import pytest
+from fastapi.testclient import TestClient
+import app.core as core
+from app.core import create_app
+
+ENV = ['DB_PASSWORD=s3cret', 'A=b=c', 'NOVALUE']
+
+
+class FakeProvider:
+    details = {'Id': 'abc', 'Config': {'Env': list(ENV), 'Image': 'nginx'}, 'HostConfig': {}}
+    def inspect_container(self, ident):
+        import copy
+        return copy.deepcopy(self.details)
+
+
+@pytest.fixture
+def make_client(tmp_path, monkeypatch):
+    monkeypatch.setenv('DOCKERFORGE_DB', str(tmp_path / 'sec.db'))
+    monkeypatch.setenv('DOCKERFORGE_SETUP_TOKEN', 'bootstrap')
+    core._failed.clear()
+    monkeypatch.setattr(core, 'provider', lambda: FakeProvider())
+    admin = TestClient(create_app(), base_url='https://testserver')
+    assert admin.post('/api/v1/auth/setup', json={'username': 'super1', 'password': 'very-long-password'},
+                      headers={'X-Setup-Token': 'bootstrap'}).status_code == 201
+
+    def login(username, password):
+        c = TestClient(admin.app, base_url='https://testserver')
+        csrf = c.get('/api/v1/auth/csrf').json()['csrf_token']
+        r = c.post('/api/v1/auth/login', json={'username': username, 'password': password}, headers={'X-CSRF-Token': csrf})
+        assert r.status_code == 200, r.text
+        return c, r.json()['csrf_token']
+
+    super_client, csrf = login('super1', 'very-long-password')
+
+    def as_role(role):
+        name = role + '1'
+        r = super_client.post('/api/v1/users', json={'username': name, 'password': 'role-long-password', 'role': role},
+                              headers={'X-CSRF-Token': csrf})
+        assert r.status_code == 201, r.text
+        return login(name, 'role-long-password')[0]
+
+    return super_client, as_role
+
+
+def test_inspect_redacts_env_for_viewer(make_client):
+    _, as_role = make_client
+    viewer = as_role('viewer')
+    data = viewer.get('/api/v1/containers/abc').json()
+    assert data['Config']['Env'] == ['DB_PASSWORD=[REDACTED]', 'A=[REDACTED]', 'NOVALUE']
+    assert data['Config']['Image'] == 'nginx'
+
+
+def test_inspect_redacts_env_for_operator(make_client):
+    _, as_role = make_client
+    assert as_role('operator').get('/api/v1/containers/abc').json()['Config']['Env'][0] == 'DB_PASSWORD=[REDACTED]'
+
+
+def test_inspect_raw_for_admin(make_client):
+    super_client, as_role = make_client
+    assert super_client.get('/api/v1/containers/abc').json()['Config']['Env'] == ENV
+    assert as_role('admin').get('/api/v1/containers/abc').json()['Config']['Env'] == ENV
+
+
+def test_inspect_without_env_ok(make_client, monkeypatch):
+    _, as_role = make_client
+    viewer = as_role('viewer')
+    for details in ({'Id': 'abc'}, {'Id': 'abc', 'Config': {'Env': None}}):
+        monkeypatch.setattr(FakeProvider, 'details', details)
+        assert viewer.get('/api/v1/containers/abc').status_code == 200
+
+
+def test_logs_forbidden_for_viewer(make_client, monkeypatch):
+    _, as_role = make_client
+    monkeypatch.setattr(core, 'fetch_logs', lambda ident, tail, ts: {'output': 'secret line', 'truncated': False})
+    r = as_role('viewer').get('/api/v1/containers/abc/logs')
+    assert r.status_code == 403
+    assert 'secret line' not in r.text
+
+
+def test_logs_allowed_for_operator(make_client, monkeypatch):
+    _, as_role = make_client
+    monkeypatch.setattr(core, 'fetch_logs', lambda ident, tail, ts: {'output': 'line', 'truncated': False})
+    assert as_role('operator').get('/api/v1/containers/abc/logs').json()['output'] == 'line'
+
+
+def test_ui_hides_logs_tab_from_viewers():
+    from app.ui import HTML
+    assert "if(!canOperate())content.textContent='Operator permission required.';else await setupLogWorkspace(content,id);" in HTML
+
+
+def test_prune_failed_drops_expired_entries():
+    core._failed.clear()
+    core._failed.update({('1.1.1.1', 'old'): [100, 200], ('1.1.1.1', 'new'): [100, 950]})
+    core.prune_failed(1000)
+    assert set(core._failed) == {('1.1.1.1', 'new')}
+
+
+def test_prune_failed_caps_keys_keeping_newest():
+    core._failed.clear()
+    for i in range(5):
+        core._failed[('ip', f'u{i}')] = [900 + i]
+    core.prune_failed(1000, cap=3)
+    assert set(core._failed) == {('ip', 'u2'), ('ip', 'u3'), ('ip', 'u4')}
+    core._failed.clear()
+
+
+SECURITY_HEADERS = {'x-frame-options': 'DENY', 'referrer-policy': 'no-referrer',
+                    'strict-transport-security': 'max-age=31536000'}
+
+
+def test_security_headers_on_success_and_error(make_client):
+    super_client, _ = make_client
+    anonymous = TestClient(super_client.app, base_url='https://testserver')
+    for response in (anonymous.get('/health'), anonymous.get('/api/v1/auth/session')):
+        for name, value in SECURITY_HEADERS.items():
+            assert response.headers.get(name) == value, (response.status_code, name)
+    assert anonymous.get('/api/v1/auth/session').status_code == 401
+
+
+def _login_attempt(client, username, password='wrong-password-xx'):
+    csrf = client.get('/api/v1/auth/csrf').json()['csrf_token']
+    return client.post('/api/v1/auth/login', json={'username': username, 'password': password},
+                       headers={'X-CSRF-Token': csrf}).status_code
+
+
+def test_username_flood_cannot_reset_lockout(make_client, monkeypatch):
+    super_client, _ = make_client
+    monkeypatch.setattr(core, 'FAILED_CAP', 3)
+    attacker = TestClient(super_client.app, base_url='https://testserver')
+    for _ in range(5):
+        assert _login_attempt(attacker, 'super1') == 401
+    assert _login_attempt(attacker, 'super1') == 429
+    for i in range(10):
+        _login_attempt(attacker, f'junk{i}')
+    assert _login_attempt(attacker, 'super1') == 429
+
+
+def test_per_ip_failure_limit(make_client):
+    super_client, _ = make_client
+    attacker = TestClient(super_client.app, base_url='https://testserver')
+    codes = [_login_attempt(attacker, f'spray{i}') for i in range(core.IP_FAILURE_LIMIT)]
+    assert set(codes) == {401}
+    assert _login_attempt(attacker, 'spray-next') == 429

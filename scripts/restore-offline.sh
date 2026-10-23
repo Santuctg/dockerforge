@@ -9,6 +9,7 @@ DIR="$(realpath -e -- "$1")"
 STAMP=$(date -u +%Y%m%dT%H%M%SZ)
 CHECKPOINT=/root/dockerforge-pre-restore-$STAMP
 mkdir -m 0700 "$CHECKPOINT"
+trap 'echo "Restore failed; pre-restore checkpoint: $CHECKPOINT" >&2' ERR
 cp -a /opt/dockerforge/backend "$CHECKPOINT/backend"
 cp -a /etc/dockerforge "$CHECKPOINT/etc-dockerforge"
 systemctl stop dockerforge-metrics 2>/dev/null || true
@@ -18,7 +19,12 @@ if [[ -f /var/lib/dockerforge/metrics.db ]]; then cp -a /var/lib/dockerforge/met
 if [[ -d /var/lib/dockerforge/stacks ]]; then cp -a /var/lib/dockerforge/stacks "$CHECKPOINT/stacks"; fi
 cp -a /etc/systemd/system/dockerforge.service "$CHECKPOINT/dockerforge.service"
 if [[ -f /etc/systemd/system/dockerforge-metrics.service ]]; then cp -a /etc/systemd/system/dockerforge-metrics.service "$CHECKPOINT/dockerforge-metrics.service"; fi
-cp -a "$DIR/backend/." /opt/dockerforge/backend/
+# Replace, not overlay: stage the backup first so a failed copy leaves the current backend in place.
+STAGING=/opt/dockerforge/.restore-staging-$STAMP
+mkdir -m 0755 "$STAGING"
+cp -a "$DIR/backend/." "$STAGING/"
+rm -rf /opt/dockerforge/backend
+mv "$STAGING" /opt/dockerforge/backend
 install -m 0600 -o dockerforge -g dockerforge "$DIR/dockerforge.db" /var/lib/dockerforge/dockerforge.db
 if [[ -f "$DIR/metrics.db" ]]; then install -m 0600 -o dockerforge -g dockerforge "$DIR/metrics.db" /var/lib/dockerforge/metrics.db; fi
 cp -a "$DIR/etc-dockerforge/." /etc/dockerforge/

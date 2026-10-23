@@ -1,0 +1,21 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: pip install "fastapi>=0.110,<1" "uvicorn>=0.27,<1" "argon2-cffi>=23,<26" "pydantic>=2,<3" "pytest>=8,<10" "httpx>=0.27,<1" shellcheck-py
+      - name: Tests
+        working-directory: backend
+        run: pytest -q
+      - name: Shellcheck
+        run: shellcheck -x installer/install.sh installer/lib.sh installer/uninstall.sh installer/tls-deploy-hook.sh installer/upgrade.sh scripts/restore-offline.sh
