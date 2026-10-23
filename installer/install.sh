@@ -235,13 +235,6 @@ PY
   echo "Previous install backed up to $BACKUP"
 }
 
-# Copy the backend owned by root (not the git checkout's user) and without tests or caches.
-stage_backend() {
-  mkdir -m 0755 "$2"
-  tar -C "$1" --exclude=./tests --exclude=.pytest_cache --exclude=__pycache__ -cf - . | tar -C "$2" --no-same-owner -xf -
-  if [[ $(id -u) -eq 0 ]]; then chown -R root:root "$2"; fi
-}
-
 step_app() {
   [[ -f $APP/app/core.py ]] && backup_existing
   STAGING=/opt/dockerforge/.staging-$STAMP

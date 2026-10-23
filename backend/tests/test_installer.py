@@ -225,8 +225,7 @@ def test_stage_backend_excludes_tests_and_caches(tmp_path):
     (src / '.pytest_cache').mkdir()
     (src / 'pyproject.toml').write_text('x')
     dest = tmp_path / 'dest'
-    r = subprocess.run(['bash', '-c', f'source "{INSTALL}" --source-only; stage_backend "{src}" "{dest}"'],
-                       capture_output=True, text=True)
+    r = sh(f'stage_backend "{src}" "{dest}"')
     assert r.returncode == 0, r.stderr
     assert (dest / 'app' / 'core.py').is_file() and (dest / 'pyproject.toml').is_file()
     assert not (dest / 'tests').exists() and not (dest / '.pytest_cache').exists()
@@ -377,3 +376,24 @@ def test_dns_mode_skips_port80_and_dns_check(tmp_path):
                                 {'ufw': '[[ "$1" == status ]] && echo "Status: active"; exit 0'})
     assert 'ufw allow 9443/tcp' in calls2
     assert 'ufw allow 80/tcp' not in calls2
+
+
+# --- security hardening: scripts and units ---
+
+def test_restore_empties_backend_before_copy():
+    text = (REPO / 'scripts' / 'restore-offline.sh').read_text()
+    assert 'rm -rf /opt/dockerforge/backend' in text
+    assert text.index('rm -rf /opt/dockerforge/backend') < text.index('cp -a "$DIR/backend/."')
+    assert text.index('cp -a /opt/dockerforge/backend "$CHECKPOINT/backend"') < text.index('rm -rf /opt/dockerforge/backend')
+
+
+def test_upgrade_stages_backend_like_installer():
+    text = (REPO / 'installer' / 'upgrade.sh').read_text()
+    assert '. "$ROOT/installer/lib.sh"' in text
+    assert 'stage_backend "$ROOT/backend" "$STAGING"' in text
+    assert 'cp -a "$ROOT/backend/."' not in text
+
+
+def test_units_set_umask():
+    for unit in ('dockerforge.service', 'dockerforge-metrics.service'):
+        assert 'UMask=0027' in (REPO / 'systemd' / unit).read_text().splitlines(), unit

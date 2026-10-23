@@ -18,6 +18,9 @@ if [[ -f /var/lib/dockerforge/metrics.db ]]; then cp -a /var/lib/dockerforge/met
 if [[ -d /var/lib/dockerforge/stacks ]]; then cp -a /var/lib/dockerforge/stacks "$CHECKPOINT/stacks"; fi
 cp -a /etc/systemd/system/dockerforge.service "$CHECKPOINT/dockerforge.service"
 if [[ -f /etc/systemd/system/dockerforge-metrics.service ]]; then cp -a /etc/systemd/system/dockerforge-metrics.service "$CHECKPOINT/dockerforge-metrics.service"; fi
+# Replace, not overlay: files added by the newer version must not survive the restore.
+rm -rf /opt/dockerforge/backend
+mkdir -m 0755 /opt/dockerforge/backend
 cp -a "$DIR/backend/." /opt/dockerforge/backend/
 install -m 0600 -o dockerforge -g dockerforge "$DIR/dockerforge.db" /var/lib/dockerforge/dockerforge.db
 if [[ -f "$DIR/metrics.db" ]]; then install -m 0600 -o dockerforge -g dockerforge "$DIR/metrics.db" /var/lib/dockerforge/metrics.db; fi
