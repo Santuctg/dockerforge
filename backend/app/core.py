@@ -4,12 +4,14 @@ from threading import Lock
 from argon2 import PasswordHasher
 from fastapi import FastAPI, Request, HTTPException, Depends
 from fastapi.responses import JSONResponse, HTMLResponse
+from typing import Literal
 from pydantic import BaseModel, Field
 from app.stack.compose import StackDefinition, ComposeFailure, create_stack, list_stacks, stack_action, stack_name, read_stack, update_stack
 from app.stack.container_tools import ExecCommand, logs as fetch_logs, execute as exec_container
 from app.docker.local_provider import LocalDockerProvider
 from app.docker.containers import CreateContainer, valid_id
 from app.docker.errors import DockerOperationError
+from app.docker import edit as container_edit
 from app.docker.resources import ImagePull, NetworkCreate, VolumeCreate, TypedDelete, safe_resource_name, validate_port_availability
 
 DB = os.environ.get('DOCKERFORGE_DB','/var/lib/dockerforge/dockerforge.db')
@@ -22,6 +24,9 @@ ADMINS = {'super_admin','admin'}
 _ph = PasswordHasher()
 _init_lock = Lock()
 _failed = {}
+RECREATE_SETTLE = 3.0
+# Stop waits for the container's stop timeout and pulls can take minutes.
+RECREATE_TIMEOUT = 600.0
 _failed_ip = {}
 _failed_lock = Lock()
 FAILED_CAP = 10000
@@ -41,7 +46,8 @@ def initialize():
         db.executescript('''CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, username TEXT NOT NULL UNIQUE COLLATE NOCASE, password_hash TEXT NOT NULL, role TEXT NOT NULL CHECK(role IN ('super_admin','admin','operator','viewer')), created_at INTEGER NOT NULL);
         CREATE TABLE IF NOT EXISTS sessions(id_hash TEXT PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id), csrf_hash TEXT NOT NULL, created_at INTEGER NOT NULL, last_seen INTEGER NOT NULL, expires_at INTEGER NOT NULL);
         CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY, ts INTEGER NOT NULL, actor TEXT, action TEXT NOT NULL, resource TEXT, ip TEXT, result TEXT NOT NULL, request_id TEXT, metadata TEXT NOT NULL);
-        CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit(ts DESC);''')
+        CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit(ts DESC);
+        CREATE TABLE IF NOT EXISTS container_backups(name TEXT PRIMARY KEY, new_id TEXT NOT NULL, old_id TEXT NOT NULL, old_name TEXT NOT NULL, created_at INTEGER NOT NULL, restart_policy TEXT NOT NULL DEFAULT '{}');''')
 
 def digest(value):return hashlib.sha256(value.encode()).hexdigest()
 def client_ip(req):return req.client.host if req.client else 'unknown'
@@ -97,6 +103,26 @@ def require_csrf(req:Request):
         fail('CSRF_INVALID','Invalid CSRF token',403)
     return user
 
+class SqliteBackupStore:
+    """One recreate backup per container name, kept in the application database."""
+    def get(self,name):
+        with conn() as db:r=db.execute('SELECT new_id,old_id,old_name,created_at,restart_policy FROM container_backups WHERE name=?',(name,)).fetchone()
+        return {**dict(r),'restart_policy':json.loads(r['restart_policy'])} if r else None
+    def put(self,name,new_id,old_id,old_name,ts,restart_policy):
+        with conn() as db:db.execute('INSERT OR REPLACE INTO container_backups VALUES(?,?,?,?,?,?)',(name,new_id,old_id,old_name,ts,json.dumps(restart_policy)))
+    def delete(self,name):
+        with conn() as db:db.execute('DELETE FROM container_backups WHERE name=?',(name,))
+    def rename(self,old,new):
+        with conn() as db:db.execute('UPDATE container_backups SET name=? WHERE name=?',(new,old))
+
+class ResourceUpdate(BaseModel):
+    memory_mb:int|None=Field(default=None,ge=16,le=1048576)
+    nano_cpus:int|None=Field(default=None,ge=0)
+    restart:Literal['no','always','unless-stopped','on-failure']='unless-stopped'
+
+class RenameRequest(BaseModel):
+    name:str=Field(min_length=1,max_length=128,pattern=r'^[A-Za-z0-9][A-Za-z0-9_.-]*$')
+
 class Credentials(BaseModel):
     username:str=Field(min_length=3,max_length=64)
     password:str=Field(min_length=12,max_length=256)
@@ -127,7 +153,7 @@ def redact_env(details):
     env=[e.split('=',1)[0]+'=[REDACTED]' if isinstance(e,str) and '=' in e else e for e in config['Env']]
     return {**details,'Config':{**config,'Env':env}}
 
-def provider():return LocalDockerProvider(os.environ.get('DOCKERFORGE_DOCKER_SOCKET','/var/run/docker.sock'))
+def provider(timeout=8.0):return LocalDockerProvider(os.environ.get('DOCKERFORGE_DOCKER_SOCKET','/var/run/docker.sock'),timeout=timeout)
 
 def create_app():
     initialize()
@@ -411,6 +437,79 @@ def create_app():
         try:return fetch_logs(ident,tail,timestamps)
         except ValueError:fail('INVALID_REQUEST','Invalid container or tail count',422)
         except RuntimeError:fail('DOCKER_LOGS_FAILED','Unable to retrieve container logs',502)
+
+    def _container_name(ident):
+        try:return (provider().inspect_container(valid_id(ident)).get('Name') or '').lstrip('/') or ident
+        except DockerOperationError:return ident
+
+    def _edit_call(req,user,action,ident,operation):
+        try:result=operation()
+        except container_edit.EditError as exc:
+            audit(req,action,'denied',user=user['username'],resource=ident,metadata={'code':exc.code})
+            fail(exc.code,exc.message,exc.status)
+        except DockerOperationError as exc:
+            audit(req,action,'denied',user=user['username'],resource=ident,metadata={'code':exc.code})
+            fail(exc.code,str(exc),exc.status_code)
+        except ValueError:fail('INVALID_CONTAINER','Invalid container identifier',422)
+        audit(req,action,user=user['username'],resource=ident,metadata=result)
+        return result
+
+    @app.get('/api/v1/containers/{ident}/edit')
+    def container_edit_spec(ident:str,user=Depends(require_role(ADMINS))):
+        try:
+            p=provider();details=p.inspect_container(valid_id(ident))
+            try:image=p.inspect_image(details.get('Image') or (details.get('Config') or {}).get('Image'))
+            except DockerOperationError:image={}
+        except DockerOperationError as exc:fail(exc.code,str(exc),exc.status_code)
+        except ValueError:fail('INVALID_CONTAINER','Invalid container identifier',422)
+        try:spec=container_edit.edit_spec(details,image)
+        except (ValueError,TypeError,KeyError):fail('INVALID_CONTAINER','Container settings could not be read for editing',422)
+        backup=SqliteBackupStore().get(spec['name'])
+        return {**spec,'backup':{'old_name':backup['old_name'],'created_at':backup['created_at']} if backup else None}
+
+    @app.post('/api/v1/containers/{ident}/resources')
+    def container_resources(ident:str,body:ResourceUpdate,req:Request,user=Depends(require_csrf)):
+        if user['role'] not in ADMINS:fail('FORBIDDEN','Admin required',403)
+        update={'RestartPolicy':{'Name':body.restart}}
+        # Removing a memory limit needs a recreate; Docker refuses Memory=0 on update.
+        # Swap at twice the memory matches Docker's default for a new limit.
+        if body.memory_mb:update.update(Memory=body.memory_mb*1024*1024,MemorySwap=2*body.memory_mb*1024*1024)
+        if body.nano_cpus is not None:
+            update['NanoCpus']=body.nano_cpus
+            if body.nano_cpus:update.update(CpuQuota=0,CpuPeriod=0)
+        return _edit_call(req,user,'container.resources',ident,lambda:provider().update_container(valid_id(ident),update) or {'updated':True})
+
+    @app.post('/api/v1/containers/{ident}/rename')
+    def container_rename(ident:str,body:RenameRequest,req:Request,user=Depends(require_csrf)):
+        if user['role'] not in ADMINS:fail('FORBIDDEN','Admin required',403)
+        old=_container_name(ident)
+        def run():
+            provider().rename_container(valid_id(ident),body.name);SqliteBackupStore().rename(old,body.name)
+            return {'name':body.name}
+        return _edit_call(req,user,'container.rename',ident,run)
+
+    @app.post('/api/v1/containers/{ident}/networks/{network}/{op}')
+    def container_network(ident:str,network:str,op:str,req:Request,user=Depends(require_csrf)):
+        if user['role'] not in ADMINS:fail('FORBIDDEN','Admin required',403)
+        if op not in ('connect','disconnect'):fail('NOT_FOUND','Unknown network operation',404)
+        if network in ('host','none'):fail('INVALID_NETWORK','Built-in host/none networks cannot be attached this way',422)
+        call=provider().connect_network if op=='connect' else provider().disconnect_network
+        return _edit_call(req,user,'container.network_'+op,ident,lambda:call(valid_id(network),valid_id(ident)) or {'network':network})
+
+    @app.post('/api/v1/containers/{ident}/recreate')
+    def container_recreate(ident:str,body:container_edit.ContainerEdit,req:Request,user=Depends(require_csrf)):
+        if user['role'] not in ADMINS:fail('FORBIDDEN','Admin required',403)
+        return _edit_call(req,user,'container.recreate',ident,lambda:container_edit.recreate(provider(timeout=RECREATE_TIMEOUT),valid_id(ident),body,SqliteBackupStore(),int(time.time()),settle=RECREATE_SETTLE))
+
+    @app.post('/api/v1/containers/{ident}/rollback')
+    def container_rollback(ident:str,req:Request,user=Depends(require_csrf)):
+        if user['role'] not in ADMINS:fail('FORBIDDEN','Admin required',403)
+        return _edit_call(req,user,'container.rollback',ident,lambda:container_edit.rollback(provider(),_container_name(ident),SqliteBackupStore()))
+
+    @app.delete('/api/v1/containers/{ident}/backup')
+    def container_backup_remove(ident:str,req:Request,user=Depends(require_csrf)):
+        if user['role'] not in ADMINS:fail('FORBIDDEN','Admin required',403)
+        return _edit_call(req,user,'container.backup_remove',ident,lambda:container_edit.remove_backup(provider(),_container_name(ident),SqliteBackupStore()))
 
     @app.post('/api/v1/containers/{ident}/exec')
     def container_exec(ident:str,body:ExecCommand,req:Request,user=Depends(require_csrf)):
