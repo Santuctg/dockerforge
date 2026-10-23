@@ -134,6 +134,21 @@ class LocalDockerProvider(DockerProvider):
         return self._call('DELETE','/containers/' + valid_id(ident) + '?' + urlencode({'force':str(force).lower(),'v':str(remove_volumes).lower()}))
 
 
+    def update_container(self, ident: str, body: dict):
+        return self._call('POST', '/containers/' + valid_id(ident) + '/update', body=body)
+
+    def rename_container(self, ident: str, new_name: str):
+        return self._call('POST', '/containers/' + valid_id(ident) + '/rename?' + urlencode({'name': valid_id(new_name)}))
+
+    def connect_network(self, network: str, ident: str):
+        return self._call('POST', '/networks/' + valid_id(network) + '/connect', body={'Container': valid_id(ident)})
+
+    def disconnect_network(self, network: str, ident: str):
+        return self._call('POST', '/networks/' + valid_id(network) + '/disconnect', body={'Container': valid_id(ident), 'Force': False})
+
+    def inspect_image(self, ref: str):
+        return self._get('/images/' + quote(ref, safe='') + '/json')
+
     def pull_image(self, image: str):
         # Docker pull endpoint expects fromImage as a query parameter.
         return self._call('POST', '/images/create?' + urlencode({'fromImage':image}))
