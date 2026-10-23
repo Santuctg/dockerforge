@@ -243,7 +243,12 @@ function setupConsoleWorkspace(content,id){
 }
 function editEl(tag,props={},children=[]){const el=document.createElement(tag);Object.assign(el,props);el.append(...children);return el}
 function editField(label,input){return editEl('label',{className:'edit-field'},[editEl('span',{textContent:label}),input])}
-function parsePortLines(text){const out=[];for(const raw of text.split(String.fromCharCode(10))){const line=raw.trim();if(!line)continue;const [spec,proto='tcp']=line.split('/');const parts=spec.split(':');if(parts.length<2||parts.length>3)throw Error('Port lines look like 8080:80 or 127.0.0.1:8080:80/udp');const host_ip=parts.length===3?parts[0]:'127.0.0.1';const host_port=Number(parts[parts.length-2]);const container_port=Number(parts[parts.length-1]);if(!Number.isInteger(host_port)||!Number.isInteger(container_port))throw Error('Invalid port line: '+line);out.push({host_ip,host_port,container_port,protocol:proto})}return out}
+function formatPortLines(bindings){return (bindings||[]).map(p=>{const ip=p.host_ip===''?'*':(p.host_ip.includes(':')?'['+p.host_ip+']':p.host_ip);return ip+':'+(p.host_port??'')+':'+p.container_port+'/'+p.protocol}).join(String.fromCharCode(10))}
+function parsePortLines(text){const out=[];for(const raw of text.split(String.fromCharCode(10))){const line=raw.trim();if(!line)continue;const slash=line.lastIndexOf('/');const proto=slash>0?line.slice(slash+1):'tcp';let spec=slash>0?line.slice(0,slash):line;let host_ip='127.0.0.1';if(spec.startsWith('[')){const close=spec.indexOf(']:');if(close<0)throw Error('Invalid IPv6 port line: '+line);host_ip=spec.slice(1,close);spec=spec.slice(close+2)}const parts=spec.split(':');if(parts.length===3){host_ip=parts.shift()}else if(parts.length!==2||spec!==parts.join(':'))throw Error('Port lines look like 8080:80, 0.0.0.0:443:443/tcp, *::80 (random port) or [::]:443:443');if(host_ip==='*')host_ip='';const host_port=parts[0]===''?null:Number(parts[0]);const container_port=Number(parts[1]);if((host_port!==null&&!Number.isInteger(host_port))||!Number.isInteger(container_port))throw Error('Invalid port line: '+line);out.push({host_ip,host_port,container_port,protocol:proto})}return out}
+function formatCommand(cmd){return cmd?JSON.stringify(cmd):''}
+function parseCommand(text){const t=text.trim();if(!t)return null;let value;try{value=JSON.parse(t)}catch(e){value=null}if(!Array.isArray(value)||!value.every(x=>typeof x==='string'))throw Error('Command must be a JSON array of strings, e.g. ["nginx","-g","daemon off;"]');return value}
+function formatEnv(env){return Object.entries(env||{}).map(([k,v])=>k+'='+(v.includes(String.fromCharCode(10))||v.includes(String.fromCharCode(13))||v.startsWith('"')?JSON.stringify(v):v)).join(String.fromCharCode(10))}
+function parseEnvLines(text){const env={};for(const line of text.split(String.fromCharCode(10))){if(!line.trim())continue;const i=line.indexOf('=');if(i<1)throw Error('Environment lines must be KEY=value');let value=line.slice(i+1);if(value.startsWith('"')){try{value=JSON.parse(value)}catch(e){throw Error('Quoted value for '+line.slice(0,i)+' must be a JSON string')}}env[line.slice(0,i).trim()]=value}return env}
 function editLines(text){return text.split(String.fromCharCode(10)).map(l=>l.trim()).filter(Boolean)}
 async function saveResources(id,values){return call('containers/'+encodeURIComponent(id)+'/resources','POST',values)}
 async function renameContainer(id,newName){return call('containers/'+encodeURIComponent(id)+'/rename','POST',{name:newName})}
@@ -257,7 +262,9 @@ async function setupEditWorkspace(content,id,name){
  const memory=editEl('input',{type:'number',min:16,placeholder:'MiB (empty = keep)',value:spec.memory_mb??''});
  const cpus=editEl('input',{type:'number',min:0.01,step:0.01,placeholder:'CPU cores (empty = keep)',value:spec.nano_cpus?spec.nano_cpus/1e9:''});
  const restart=editEl('select',{},['no','always','unless-stopped','on-failure'].map(v=>editEl('option',{value:v,textContent:v,selected:v===spec.restart})));
- const live=()=>({memory_mb:memory.value?Number(memory.value):null,nano_cpus:cpus.value?Math.round(Number(cpus.value)*1e9):null,restart:restart.value});
+ const memoryValue=()=>memory.value?Number(memory.value):null;const cpusValue=()=>cpus.value?Math.round(Number(cpus.value)*1e9):null;
+ const memoryChanged=()=>memoryValue()===(spec.memory_mb??null)?null:memoryValue();const cpusChanged=()=>cpusValue()===(spec.nano_cpus??null)?null:cpusValue();
+ const live=()=>({memory_mb:memoryChanged(),nano_cpus:cpusChanged(),restart:restart.value});
  const newName=editEl('input',{value:spec.name});const network=editEl('input',{placeholder:'network name'});
  content.append(editEl('h4',{textContent:'Live settings (no restart)'}),editField('Memory limit',memory),editField('CPU limit',cpus),editField('Restart policy',restart),
   makeToolButton('Save live settings',guard(async()=>{await saveResources(id,live());await done('Live settings saved')})),
@@ -270,13 +277,12 @@ async function setupEditWorkspace(content,id,name){
   content.append(editEl('p',{className:'hint',textContent:'Managed by Compose stack '+spec.compose_project+'. Edit the stack instead, so the next deploy keeps your changes.'}),makeToolButton('Open Compose stacks',()=>navigate('compose')));
  }else{
   const image=editEl('input',{value:spec.image||''});
-  const command=editEl('input',{placeholder:'empty = image default',value:spec.command?spec.command.join(' '):''});
-  const env=editEl('textarea',{rows:4,value:Object.entries(spec.environment||{}).map(([k,v])=>k+'='+v).join(String.fromCharCode(10))});
-  const ports=editEl('textarea',{rows:3,placeholder:'8080:80 or 0.0.0.0:443:443/tcp',value:(spec.port_bindings||[]).map(p=>p.host_ip+':'+p.host_port+':'+p.container_port+'/'+p.protocol).join(String.fromCharCode(10))});
+  const command=editEl('input',{placeholder:'JSON array, empty = image default',value:formatCommand(spec.command)});
+  const env=editEl('textarea',{rows:4,value:formatEnv(spec.environment)});
+  const ports=editEl('textarea',{rows:3,placeholder:'8080:80, 0.0.0.0:443:443/tcp, *::80 (random), [::]:443:443',value:formatPortLines(spec.port_bindings)});
   const mounts=editEl('textarea',{rows:3,placeholder:'/host/path:/container/path or volume:/path[:ro]',value:(spec.mounts||[]).join(String.fromCharCode(10))});
   const ackRisk=editEl('input',{type:'checkbox'});const ackPublic=editEl('input',{type:'checkbox'});
-  const body=pull=>{const environment={};for(const line of editLines(env.value)){const i=line.indexOf('=');if(i<1)throw Error('Environment lines must be KEY=value');environment[line.slice(0,i)]=line.slice(i+1)}
-   const cmd=command.value.trim();return {image:image.value.trim(),command:cmd?cmd.split(' ').filter(Boolean):null,environment,port_bindings:parsePortLines(ports.value),mounts:editLines(mounts.value),...live(),restart:restart.value,pull,acknowledge_high_risk:ackRisk.checked,acknowledge_public_ports:ackPublic.checked}};
+  const body=pull=>({image:image.value.trim(),command:parseCommand(command.value),environment:parseEnvLines(env.value),port_bindings:parsePortLines(ports.value),mounts:editLines(mounts.value),memory_mb:memoryValue(),nano_cpus:cpusValue(),restart:restart.value,pull,acknowledge_high_risk:ackRisk.checked,acknowledge_public_ports:ackPublic.checked});
   const run=pull=>guard(async()=>{if(!confirm('Recreate '+name+'? It will be stopped and replaced; the old container is kept as a backup.'))return;status.textContent='Recreating…';const r=await recreateContainer(id,body(pull));await done('Recreated; backup '+r.backup,r.id,r.name)});
   content.append(editField('Image',image),editField('Command',command),editField('Environment (KEY=value per line)',env),editField('Ports',ports),editField('Mounts',mounts),
    editField('I accept host-level risk (bind mounts, privileged, host network)',ackRisk),editField('I accept exposing ports beyond localhost',ackPublic),

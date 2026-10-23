@@ -633,3 +633,45 @@ def test_edit_spec_route_handles_random_ports(api):
     admin, _, docker = api
     docker.containers[OLD_ID]['HostConfig']['PortBindings'] = {'80/tcp': [{'HostIp': '', 'HostPort': ''}]}
     assert admin.get('/api/v1/containers/web/edit').status_code == 200
+
+
+# --- UI helpers, run in Node ---
+import json as _json
+import shutil
+import subprocess as _sp
+
+
+def _js_functions(*names):
+    lines = HTML.splitlines()
+    return '\n'.join(next(l for l in lines if l.startswith(f'function {n}(')) for n in names)
+
+
+@pytest.mark.skipif(not shutil.which('node'), reason='node not installed')
+def test_ui_edit_helpers_round_trip():
+    script = _js_functions('formatCommand', 'parseCommand', 'formatEnv', 'parseEnvLines', 'formatPortLines', 'parsePortLines') + '''
+const out = {};
+const cmd = ["sh","-c","echo hi && sleep 1d"];
+out.cmd = parseCommand(formatCommand(cmd));
+out.cmdEmpty = parseCommand('');
+try { parseCommand('nginx -g'); out.cmdBad = 'no error' } catch (e) { out.cmdBad = 'error' }
+const env = {KEY: "line1\\nline2", Q: '"quoted"', PLAIN: 'a=b c'};
+out.env = parseEnvLines(formatEnv(env));
+const ports = [{host_ip:'',host_port:null,container_port:80,protocol:'tcp'},{host_ip:'::',host_port:8443,container_port:443,protocol:'tcp'},
+               {host_ip:'127.0.0.1',host_port:8080,container_port:80,protocol:'udp'}];
+out.ports = parsePortLines(formatPortLines(ports));
+out.short = parsePortLines('8080:80');
+console.log(JSON.stringify(out));
+'''
+    result = _sp.run(['node', '-e', script], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    out = _json.loads(result.stdout)
+    assert out['cmd'] == ['sh', '-c', 'echo hi && sleep 1d'] and out['cmdEmpty'] is None and out['cmdBad'] == 'error'
+    assert out['env'] == {'KEY': 'line1\nline2', 'Q': '"quoted"', 'PLAIN': 'a=b c'}
+    assert out['ports'] == [{'host_ip': '', 'host_port': None, 'container_port': 80, 'protocol': 'tcp'},
+                            {'host_ip': '::', 'host_port': 8443, 'container_port': 443, 'protocol': 'tcp'},
+                            {'host_ip': '127.0.0.1', 'host_port': 8080, 'container_port': 80, 'protocol': 'udp'}]
+    assert out['short'] == [{'host_ip': '127.0.0.1', 'host_port': 8080, 'container_port': 80, 'protocol': 'tcp'}]
+
+
+def test_ui_live_save_sends_only_changed_limits():
+    assert 'memory_mb:memoryChanged()' in HTML and 'nano_cpus:cpusChanged()' in HTML

@@ -37,6 +37,11 @@ Admins get an **Edit** tab in container details.
 - **Live settings** apply immediately without a restart: memory and CPU limits, restart policy, rename, and connect/disconnect networks. Removing a memory limit entirely needs a recreate.
 - **Edit & recreate** changes the image/tag, command, environment, ports and mounts. DockerForge keeps every setting the form does not show (labels, user, working dir, healthcheck, privileged/devices, network mode), stops the old container, renames it `<name>-old-<time>`, and starts a new one under the original name. If the new container does not start, or exits within 3 seconds, it is removed and the old one is restored. Volumes, including anonymous ones, stay attached, and data is never deleted.
 - **Update image** pulls the image again and recreates with the same settings.
+- Form formats:
+  - Command is a JSON array (`["sh","-c","echo hi && sleep 1d"]`); leave it empty to use the image default.
+  - Environment is one `KEY=value` per line; values with line breaks are written as JSON strings (`KEY="line1\nline2"`).
+  - Ports are `[host_ip:]host_port:container_port[/proto]`, where `*` means all interfaces, an empty host port means a random one, and IPv6 goes in brackets (`[::]:443:443`).
+- Containers started with `--rm` can't be recreated, because Docker deletes them when they stop.
 - The old container is kept, stopped, as a **backup**: **Roll back** brings it back, and **Remove backup** deletes it (volumes are kept). A new recreate replaces the previous backup.
 - Containers that belong to a Docker Compose project can't be recreated here. Edit the stack instead, so the next deploy keeps the change. Live settings still work on them.
 
