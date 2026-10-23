@@ -105,6 +105,13 @@ class DeleteConfirmation(BaseModel):
     force:bool=False
     remove_volumes:bool=False
 
+def redact_env(details):
+    # Env values often hold passwords/tokens; keep only variable names for non-admins.
+    config=details.get('Config') if isinstance(details,dict) else None
+    if not isinstance(config,dict) or not isinstance(config.get('Env'),list):return details
+    env=[e.split('=',1)[0]+'=[REDACTED]' if isinstance(e,str) and '=' in e else e for e in config['Env']]
+    return {**details,'Config':{**config,'Env':env}}
+
 def provider():return LocalDockerProvider(os.environ.get('DOCKERFORGE_DOCKER_SOCKET','/var/run/docker.sock'))
 
 def create_app():
@@ -402,7 +409,9 @@ def create_app():
 
     @app.get('/api/v1/containers/{ident}')
     def inspect_container(ident:str,user=Depends(require_role(READ))):
-        try:return provider().inspect_container(valid_id(ident))
+        try:
+            details=provider().inspect_container(valid_id(ident))
+            return details if user['role'] in ADMINS else redact_env(details)
         except DockerOperationError as exc:fail(exc.code,str(exc),exc.status_code)
         except ValueError:fail('INVALID_CONTAINER','Invalid container identifier',422)
 
