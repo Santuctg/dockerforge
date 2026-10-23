@@ -397,3 +397,10 @@ def test_upgrade_stages_backend_like_installer():
 def test_units_set_umask():
     for unit in ('dockerforge.service', 'dockerforge-metrics.service'):
         assert 'UMask=0027' in (REPO / 'systemd' / unit).read_text().splitlines(), unit
+
+
+def test_ci_workflow_runs_tests_and_shellcheck():
+    text = (REPO / '.github' / 'workflows' / 'ci.yml').read_text()
+    for needle in ['push:', 'pull_request:', "python-version: '3.12'", 'pytest -q',
+                   'shellcheck -x installer/install.sh installer/lib.sh installer/uninstall.sh installer/tls-deploy-hook.sh']:
+        assert needle in text, needle
