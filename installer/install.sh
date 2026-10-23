@@ -20,16 +20,19 @@ UNITS=(dockerforge.service dockerforge-metrics.service dockerforge-backup.servic
 STEPS=(step_preflight step_packages step_docker step_user_dirs step_app
        step_config step_firewall step_tls step_services step_verify)
 SYSTEMD_DIR=/etc/systemd/system
+TLS_HOOK=/usr/local/sbin/dockerforge-tls-deploy
 
-DOMAIN='' EMAIL='' ASSUME_YES=0 NO_FIREWALL=0 CHECK_ONLY=0 SKIP_DNS=0
+DOMAIN='' EMAIL='' ASSUME_YES=0 NO_FIREWALL=0 CHECK_ONLY=0 SKIP_DNS=0 DNS_PROVIDER=''
 FAMILY='' OS_ID='' PY='' BACKUP='' STAGING='' APP_SWAPPED=0 DONE=0
 
 usage() {
   cat <<'EOF'
 Usage: sudo bash installer/install.sh [options]
 
-  --domain NAME    Get a Let's Encrypt certificate for NAME (needs port 80 open)
+  --domain NAME    Get a Let's Encrypt certificate for NAME (port 80 open, unless --dns)
   --email ADDRESS  Contact address for Let's Encrypt (required with --domain)
+  --dns cloudflare Get the certificate with a DNS challenge through Cloudflare instead of
+                   port 80; works with a local IP. Token from CF_API_TOKEN or asked once
   --yes            Install Docker without asking if it is missing
   --no-firewall    Do not open ports in ufw/firewalld
   --skip-dns-check Do not check that --domain points to this server
@@ -49,12 +52,18 @@ parse_args() {
       --yes) ASSUME_YES=1 ;;
       --no-firewall) NO_FIREWALL=1 ;;
       --skip-dns-check) SKIP_DNS=1 ;;
+      --dns) [[ $# -ge 2 ]] || { echo '--dns needs a value' >&2; exit 2; }; DNS_PROVIDER=$2; shift ;;
       --check) CHECK_ONLY=1 ;;
       --help|-h) usage; exit 0 ;;
       *) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
     esac
     shift
   done
+  case $DNS_PROVIDER in
+    ''|cloudflare) ;;
+    *) echo "Unsupported --dns provider: $DNS_PROVIDER (supported: cloudflare)" >&2; exit 2 ;;
+  esac
+  if [[ -n $DNS_PROVIDER && -z $DOMAIN ]]; then echo '--dns needs --domain' >&2; exit 2; fi
   if [[ -n $DOMAIN && -z $EMAIL ]]; then echo '--email is required with --domain' >&2; exit 2; fi
   if [[ -n $DOMAIN && ! $DOMAIN =~ ^[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$ ]]; then
     echo "Invalid domain: $DOMAIN" >&2; exit 2
@@ -87,21 +96,35 @@ step_preflight() {
   if port_in_use 9443 && ! systemctl is-active --quiet dockerforge; then
     die 'Port 9443 is already in use by another program'
   fi
-  if [[ -n $DOMAIN && $SKIP_DNS -ne 1 && ! -d /etc/letsencrypt/live/$DOMAIN ]]; then
+  preflight_domain
+  if [[ -f $APP/app/core.py ]]; then echo 'Existing DockerForge found: code will be updated, data kept'; fi
+}
+
+# Let's Encrypt prerequisites: DNS must point here and port 80 be free, unless a DNS challenge is used.
+preflight_domain() {
+  [[ -n $DOMAIN ]] || return 0
+  if [[ -n $DNS_PROVIDER ]]; then
+    echo "Certificate: Let's Encrypt DNS challenge via $DNS_PROVIDER (port 80 and public IP not needed)"
+    return 0
+  fi
+  [[ -d /etc/letsencrypt/live/$DOMAIN ]] && return 0
+  if [[ $SKIP_DNS -ne 1 ]]; then
     local resolved
     resolved=$(getent ahosts "$DOMAIN" 2>/dev/null | awk '{print $1}' | sort -u | tr '\n' ' ') || true
     dns_check "$DOMAIN" "$resolved" "$(public_ip)" || exit 1
     echo "DNS: $DOMAIN -> $resolved"
   fi
-  if [[ -n $DOMAIN && ! -d /etc/letsencrypt/live/$DOMAIN ]] && port_in_use 80; then
-    die 'Port 80 is in use; Let'"'"'s Encrypt needs it free to issue the certificate'
+  if port_in_use 80; then
+    die 'Port 80 is in use; Let'"'"'s Encrypt needs it free to issue the certificate (or use --dns cloudflare)'
   fi
-  if [[ -f $APP/app/core.py ]]; then echo 'Existing DockerForge found: code will be updated, data kept'; fi
 }
 
 step_packages() {
   local base extra=()
-  [[ -n $DOMAIN ]] && extra=(certbot)
+  if [[ -n $DOMAIN ]]; then
+    extra=(certbot)
+    [[ $DNS_PROVIDER == cloudflare ]] && extra+=(python3-certbot-dns-cloudflare)
+  fi
   case $FAMILY in
     debian)
       apt-get update -q
@@ -115,7 +138,8 @@ step_packages() {
       fi ;;
     suse)
       base=(python311 curl openssl iproute2)
-      [[ -n $DOMAIN ]] && extra=(python3-certbot) ;;
+      # openSUSE names the certbot package python3-certbot.
+      if [[ -n $DOMAIN ]]; then extra[0]=python3-certbot; fi ;;
   esac
   pkg_install "${base[@]}" "${extra[@]}"
   if ! PY=$(find_python); then
@@ -246,11 +270,18 @@ step_config() {
 }
 
 step_tls() {
-  install -m 0750 "$ROOT/installer/tls-deploy-hook.sh" /usr/local/sbin/dockerforge-tls-deploy
+  install -m 0750 "$ROOT/installer/tls-deploy-hook.sh" "$TLS_HOOK"
   if [[ -n $DOMAIN ]]; then
-    certbot certonly --standalone --non-interactive --agree-tos --keep-until-expiring \
-      -m "$EMAIL" -d "$DOMAIN" --deploy-hook /usr/local/sbin/dockerforge-tls-deploy
-    RENEWED_LINEAGE=/etc/letsencrypt/live/$DOMAIN /usr/local/sbin/dockerforge-tls-deploy
+    local auth=(--standalone)
+    if [[ $DNS_PROVIDER == cloudflare ]]; then
+      printf 'Cloudflare credentials: '
+      ensure_cloudflare_credentials "$CONF/cloudflare.ini" ||
+        die 'A Cloudflare API token with Zone > DNS > Edit permission is required (set CF_API_TOKEN or enter it when asked)'
+      auth=(--dns-cloudflare --dns-cloudflare-credentials "$CONF/cloudflare.ini" --dns-cloudflare-propagation-seconds 30)
+    fi
+    certbot certonly "${auth[@]}" --non-interactive --agree-tos --keep-until-expiring \
+      -m "$EMAIL" -d "$DOMAIN" --deploy-hook "$TLS_HOOK"
+    RENEWED_LINEAGE=/etc/letsencrypt/live/$DOMAIN "$TLS_HOOK"
     ensure_renew_timer
     echo "Let's Encrypt certificate installed for $DOMAIN"
   elif [[ ! -f $TLS/fullchain.pem ]]; then
@@ -304,18 +335,20 @@ step_services() {
 
 step_firewall() {
   if [[ $NO_FIREWALL -eq 1 ]]; then echo 'Firewall: skipped (--no-firewall)'; return 0; fi
+  local http=0
+  if [[ -n $DOMAIN && -z $DNS_PROVIDER ]]; then http=1; fi
   if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q 'Status: active'; then
     ufw allow 9443/tcp
-    [[ -n $DOMAIN ]] && ufw allow 80/tcp
+    if [[ $http -eq 1 ]]; then ufw allow 80/tcp; fi
   elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
     firewall-cmd --quiet --permanent --add-port=9443/tcp
-    [[ -n $DOMAIN ]] && firewall-cmd --quiet --permanent --add-port=80/tcp
+    if [[ $http -eq 1 ]]; then firewall-cmd --quiet --permanent --add-port=80/tcp; fi
     firewall-cmd --quiet --reload
   else
     echo 'Firewall: no active ufw/firewalld found, nothing changed'
     return 0
   fi
-  echo 'Firewall: opened 9443/tcp'"${DOMAIN:+ and 80/tcp}"
+  if [[ $http -eq 1 ]]; then echo 'Firewall: opened 9443/tcp and 80/tcp'; else echo 'Firewall: opened 9443/tcp'; fi
 }
 
 step_verify() {

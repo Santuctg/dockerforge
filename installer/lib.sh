@@ -107,3 +107,22 @@ dns_check() {
   echo "Update the A record to $public (with Cloudflare, use 'DNS only'), or re-run with --skip-dns-check if this is intended." >&2
   return 1
 }
+
+# Store the Cloudflare API token for certbot's DNS plugin once (root-only); never overwrite it.
+ensure_cloudflare_credentials() {
+  local path=$1 token=${CF_API_TOKEN:-} tmp
+  if [[ -e $path ]]; then echo kept; return 0; fi
+  if [[ -z $token ]] && (exec </dev/tty) 2>/dev/null; then
+    read -r -s -p 'Cloudflare API token (Zone > DNS > Edit): ' token </dev/tty || true
+    echo >&2
+  fi
+  if [[ ! $token =~ ^[A-Za-z0-9_-]{20,200}$ ]]; then
+    echo 'ERROR: missing or invalid Cloudflare API token' >&2
+    return 1
+  fi
+  tmp=$(umask 077 && mktemp "$path.XXXXXX") || return 1
+  if ! printf 'dns_cloudflare_api_token = %s\n' "$token" >"$tmp" || ! chmod 0600 "$tmp" || ! mv "$tmp" "$path"; then
+    rm -f "$tmp"; return 1
+  fi
+  echo created
+}

@@ -303,3 +303,77 @@ def test_dns_check_unknown_public_ip_passes_with_warning():
 
 def test_install_help_mentions_skip_dns_check():
     assert '--skip-dns-check' in run_script(INSTALL, '--help').stdout
+
+
+# --- Let's Encrypt DNS-01 via Cloudflare ---
+
+CF_TOKEN = 'a' * 20 + 'B_-9' * 5
+
+
+def test_dns_requires_domain():
+    r = run_script(INSTALL, '--dns', 'cloudflare')
+    assert r.returncode == 2
+    assert '--dns needs --domain' in r.stderr
+
+
+def test_dns_unknown_provider():
+    r = run_script(INSTALL, '--domain', 'x.example.com', '--email', 'a@example.com', '--dns', 'route53')
+    assert r.returncode == 2
+    assert 'Unsupported --dns provider' in r.stderr
+
+
+def test_install_help_mentions_dns():
+    assert '--dns cloudflare' in run_script(INSTALL, '--help').stdout
+
+
+def test_cloudflare_credentials_from_env_then_kept(tmp_path):
+    ini = tmp_path / 'cloudflare.ini'
+    first = sh(f'ensure_cloudflare_credentials "{ini}" </dev/null', env={'CF_API_TOKEN': CF_TOKEN})
+    assert first.returncode == 0, first.stderr
+    assert ini.stat().st_mode & 0o777 == 0o600
+    assert ini.read_text() == f'dns_cloudflare_api_token = {CF_TOKEN}\n'
+    second = sh(f'ensure_cloudflare_credentials "{ini}" </dev/null', env={'CF_API_TOKEN': 'b' * 40})
+    assert second.returncode == 0
+    assert ini.read_text() == f'dns_cloudflare_api_token = {CF_TOKEN}\n'
+
+
+def test_cloudflare_credentials_rejects_missing_or_bad_token(tmp_path):
+    ini = tmp_path / 'cloudflare.ini'
+    env = {k: v for k, v in os.environ.items() if k != 'CF_API_TOKEN'}
+    missing = subprocess.run(['setsid', 'bash', '-c', f'source "{LIB}"; ensure_cloudflare_credentials "{ini}"'],
+                             capture_output=True, text=True, env=env, stdin=subprocess.DEVNULL)
+    assert missing.returncode != 0 and not ini.exists()
+    bad = sh(f'ensure_cloudflare_credentials "{ini}" </dev/null', env={'CF_API_TOKEN': 'bad token; rm -rf /'})
+    assert bad.returncode != 0 and not ini.exists()
+    assert 'Cloudflare API token' in bad.stderr
+
+
+def test_tls_dns_cloudflare_uses_dns_plugin(tmp_path):
+    conf = tmp_path / 'conf'
+    conf.mkdir()
+    hook = tmp_path / 'hook'
+    hook.write_text('#!/bin/sh\nexit 0\n')
+    hook.chmod(0o755)
+    r, calls = run_install_fn(
+        tmp_path,
+        f'export CF_API_TOKEN={CF_TOKEN}; DOMAIN=docker.example.com; EMAIL=a@example.com; DNS_PROVIDER=cloudflare; '
+        f'CONF="{conf}"; TLS_HOOK="{hook}"; install() {{ :; }}; ensure_renew_timer() {{ :; }}; step_tls',
+        {'certbot': 'exit 0'})
+    certbot = next(l for l in calls.splitlines() if l.startswith('certbot'))
+    assert '--dns-cloudflare' in certbot.split()
+    assert f'--dns-cloudflare-credentials {conf}/cloudflare.ini' in certbot
+    assert '--standalone' not in certbot
+    assert (conf / 'cloudflare.ini').is_file()
+
+
+def test_dns_mode_skips_port80_and_dns_check(tmp_path):
+    r, calls = run_install_fn(
+        tmp_path,
+        'DOMAIN=docker.example.com; DNS_PROVIDER=cloudflare; dns_check() { echo dns_check >> /dev/stderr; return 1; }; '
+        'port_in_use() { return 0; }; preflight_domain && echo PREFLIGHT_OK',
+        {'getent': 'exit 2'})
+    assert 'PREFLIGHT_OK' in r.stdout, r.stderr
+    r2, calls2 = run_install_fn(tmp_path, 'DOMAIN=docker.example.com; DNS_PROVIDER=cloudflare; NO_FIREWALL=0; step_firewall',
+                                {'ufw': '[[ "$1" == status ]] && echo "Status: active"; exit 0'})
+    assert 'ufw allow 9443/tcp' in calls2
+    assert 'ufw allow 80/tcp' not in calls2
