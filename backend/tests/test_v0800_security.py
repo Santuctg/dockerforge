@@ -115,3 +115,29 @@ def test_security_headers_on_success_and_error(make_client):
         for name, value in SECURITY_HEADERS.items():
             assert response.headers.get(name) == value, (response.status_code, name)
     assert anonymous.get('/api/v1/auth/session').status_code == 401
+
+
+def _login_attempt(client, username, password='wrong-password-xx'):
+    csrf = client.get('/api/v1/auth/csrf').json()['csrf_token']
+    return client.post('/api/v1/auth/login', json={'username': username, 'password': password},
+                       headers={'X-CSRF-Token': csrf}).status_code
+
+
+def test_username_flood_cannot_reset_lockout(make_client, monkeypatch):
+    super_client, _ = make_client
+    monkeypatch.setattr(core, 'FAILED_CAP', 3)
+    attacker = TestClient(super_client.app, base_url='https://testserver')
+    for _ in range(5):
+        assert _login_attempt(attacker, 'super1') == 401
+    assert _login_attempt(attacker, 'super1') == 429
+    for i in range(10):
+        _login_attempt(attacker, f'junk{i}')
+    assert _login_attempt(attacker, 'super1') == 429
+
+
+def test_per_ip_failure_limit(make_client):
+    super_client, _ = make_client
+    attacker = TestClient(super_client.app, base_url='https://testserver')
+    codes = [_login_attempt(attacker, f'spray{i}') for i in range(core.IP_FAILURE_LIMIT)]
+    assert set(codes) == {401}
+    assert _login_attempt(attacker, 'spray-next') == 429

@@ -7,16 +7,22 @@ Sub-project 1 of 4 (then container edit, storage, volume file browser).
 1. **Secrets hidden from non-admins in container inspect.** `GET /api/v1/containers/{id}`:
    for roles other than `super_admin`/`admin`, every `Config.Env` entry `KEY=value`
    becomes `KEY=[REDACTED]` (entries without `=` unchanged). Admins see the raw data.
+   Limit: operators can still read a container's environment through Console (`env`),
+   so the redaction fully protects viewers only; for operators it avoids casual exposure.
+   Secrets passed as command arguments or labels are not redacted (known gap).
 2. **Container logs need Operator.** `GET /api/v1/containers/{id}/logs` requires
    `super_admin`, `admin` or `operator`; viewers get 403. The UI Logs tab shows
    "Operator permission required." for viewers, like the Console tab.
 3. **Bounded login rate-limit state.** On each login attempt, entries in `_failed`
    whose attempts are all older than 300 s are removed. If more than 10 000 keys
-   remain, the oldest (by latest attempt) are dropped down to 10 000.
-   The 5-attempts/300 s rule is unchanged.
+   remain, the keys with the fewest recent failures (then oldest) are dropped down to
+   10 000, so a flood of junk usernames cannot evict a real lockout. In addition each
+   client IP may fail at most 30 times per 300 s across all usernames (429 after that).
+   The 5-attempts/300 s per-username rule is unchanged. State is guarded by a lock.
 4. **`scripts/restore-offline.sh` replaces the backend.** After the pre-restore
-   checkpoint, it empties `/opt/dockerforge/backend` before copying the backup in,
-   so files from the newer version cannot remain.
+   checkpoint, it copies the backup into a staging directory, then replaces
+   `/opt/dockerforge/backend` with it, so files from the newer version cannot remain and
+   a failed copy leaves the current backend in place. On error it prints the checkpoint.
 5. **`installer/upgrade.sh` stages like the installer.** `stage_backend` moves from
    `install.sh` to `installer/lib.sh`; `upgrade.sh` sources `lib.sh` and uses it, so
    the deployed code is root-owned and contains no `tests/`, `.pytest_cache`,

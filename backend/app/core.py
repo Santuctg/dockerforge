@@ -22,6 +22,11 @@ ADMINS = {'super_admin','admin'}
 _ph = PasswordHasher()
 _init_lock = Lock()
 _failed = {}
+_failed_ip = {}
+_failed_lock = Lock()
+FAILED_CAP = 10000
+# Failures per client IP across all usernames; also stops key floods from evicting a lockout.
+IP_FAILURE_LIMIT = 30
 
 def conn():
     Path(os.environ.get('DOCKERFORGE_DB',DB)).parent.mkdir(parents=True,exist_ok=True)
@@ -50,11 +55,15 @@ def audit(req, action, result='success', user=None, resource=None, metadata=None
     with conn() as db:
         db.execute('INSERT INTO audit(ts,actor,action,resource,ip,result,request_id,metadata) VALUES(?,?,?,?,?,?,?,?)',(int(time.time()),user,action,resource,client_ip(req),result,getattr(req.state,'request_id',''),json.dumps(redact(metadata or {}))))
 
-def prune_failed(now,cap=10000):
+def prune_failed(now,cap=None):
+    cap=FAILED_CAP if cap is None else cap
     # Keep login rate-limit state bounded: forget expired keys, then cap by most recent attempt.
-    for key in [k for k,v in _failed.items() if not any(t>now-300 for t in v)]:_failed.pop(key,None)
+    # Caller holds _failed_lock.
+    for store in (_failed,_failed_ip):
+        for key in [k for k,v in store.items() if not any(t>now-300 for t in v)]:store.pop(key,None)
     if len(_failed)>cap:
-        for key in sorted(_failed,key=lambda k:max(_failed[k]))[:len(_failed)-cap]:_failed.pop(key,None)
+        # Evict keys with the fewest recent failures first, so a flood of junk usernames cannot clear a real lockout.
+        for key in sorted(_failed,key=lambda k:(len(_failed[k]),max(_failed[k])))[:len(_failed)-cap]:_failed.pop(key,None)
 
 def fail(code,message,status):raise HTTPException(status_code=status,detail={'code':code,'message':message})
 def user_from_session(req):
@@ -176,9 +185,12 @@ def create_app():
     def login(body:Login,req:Request):
         if not req.cookies.get(CSRF_COOKIE) or not secrets.compare_digest(req.cookies.get(CSRF_COOKIE,''), req.headers.get('X-CSRF-Token','')):
             fail('CSRF_INVALID','CSRF token required',403)
-        now=int(time.time());prune_failed(now);key=(client_ip(req),body.username.lower().strip())
-        attempts=[t for t in _failed.get(key,[]) if t>now-300]
-        if len(attempts)>=5:
+        now=int(time.time());ip=client_ip(req);key=(ip,body.username.lower().strip())
+        with _failed_lock:
+            prune_failed(now)
+            attempts=[t for t in _failed.get(key,[]) if t>now-300]
+            ip_attempts=[t for t in _failed_ip.get(ip,[]) if t>now-300]
+        if len(attempts)>=5 or len(ip_attempts)>=IP_FAILURE_LIMIT:
             audit(req,'auth.login','rate_limited',user=body.username);fail('RATE_LIMITED','Too many login attempts',429)
         with conn() as db:r=db.execute('SELECT * FROM users WHERE username=?',(body.username,)).fetchone()
         good=False
@@ -186,8 +198,10 @@ def create_app():
             try:good=_ph.verify(r['password_hash'],body.password)
             except Exception:pass
         if not good:
-            _failed[key]=attempts+[now];audit(req,'auth.login','denied',user=body.username);fail('LOGIN_FAILED','Invalid credentials',401)
-        _failed.pop(key,None)
+            with _failed_lock:
+                _failed.setdefault(key,[]).append(now);_failed_ip.setdefault(ip,[]).append(now)
+            audit(req,'auth.login','denied',user=body.username);fail('LOGIN_FAILED','Invalid credentials',401)
+        with _failed_lock:_failed.pop(key,None)
         token=secrets.token_urlsafe(48);csrf=secrets.token_urlsafe(32)
         with conn() as db:db.execute('INSERT INTO sessions VALUES(?,?,?,?,?,?)',(digest(token),r['id'],digest(csrf),now,now,now+86400))
         res=JSONResponse({'username':r['username'],'role':r['role'],'csrf_token':csrf})

@@ -380,11 +380,14 @@ def test_dns_mode_skips_port80_and_dns_check(tmp_path):
 
 # --- security hardening: scripts and units ---
 
-def test_restore_empties_backend_before_copy():
+def test_restore_stages_then_replaces_backend():
     text = (REPO / 'scripts' / 'restore-offline.sh').read_text()
-    assert 'rm -rf /opt/dockerforge/backend' in text
-    assert text.index('rm -rf /opt/dockerforge/backend') < text.index('cp -a "$DIR/backend/."')
-    assert text.index('cp -a /opt/dockerforge/backend "$CHECKPOINT/backend"') < text.index('rm -rf /opt/dockerforge/backend')
+    checkpoint = text.index('cp -a /opt/dockerforge/backend "$CHECKPOINT/backend"')
+    staged = text.index('cp -a "$DIR/backend/." "$STAGING/"')
+    removed = text.index('rm -rf /opt/dockerforge/backend')
+    moved = text.index('mv "$STAGING" /opt/dockerforge/backend')
+    assert checkpoint < staged < removed < moved
+    assert "trap 'echo \"Restore failed; pre-restore checkpoint: $CHECKPOINT\" >&2' ERR" in text
 
 
 def test_upgrade_stages_backend_like_installer():
