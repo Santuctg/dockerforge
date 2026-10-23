@@ -25,6 +25,8 @@ _ph = PasswordHasher()
 _init_lock = Lock()
 _failed = {}
 RECREATE_SETTLE = 3.0
+# Stop waits for the container's stop timeout and pulls can take minutes.
+RECREATE_TIMEOUT = 600.0
 _failed_ip = {}
 _failed_lock = Lock()
 FAILED_CAP = 10000
@@ -45,7 +47,7 @@ def initialize():
         CREATE TABLE IF NOT EXISTS sessions(id_hash TEXT PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id), csrf_hash TEXT NOT NULL, created_at INTEGER NOT NULL, last_seen INTEGER NOT NULL, expires_at INTEGER NOT NULL);
         CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY, ts INTEGER NOT NULL, actor TEXT, action TEXT NOT NULL, resource TEXT, ip TEXT, result TEXT NOT NULL, request_id TEXT, metadata TEXT NOT NULL);
         CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit(ts DESC);
-        CREATE TABLE IF NOT EXISTS container_backups(name TEXT PRIMARY KEY, new_id TEXT NOT NULL, old_id TEXT NOT NULL, old_name TEXT NOT NULL, created_at INTEGER NOT NULL);''')
+        CREATE TABLE IF NOT EXISTS container_backups(name TEXT PRIMARY KEY, new_id TEXT NOT NULL, old_id TEXT NOT NULL, old_name TEXT NOT NULL, created_at INTEGER NOT NULL, restart_policy TEXT NOT NULL DEFAULT '{}');''')
 
 def digest(value):return hashlib.sha256(value.encode()).hexdigest()
 def client_ip(req):return req.client.host if req.client else 'unknown'
@@ -104,10 +106,10 @@ def require_csrf(req:Request):
 class SqliteBackupStore:
     """One recreate backup per container name, kept in the application database."""
     def get(self,name):
-        with conn() as db:r=db.execute('SELECT new_id,old_id,old_name,created_at FROM container_backups WHERE name=?',(name,)).fetchone()
-        return dict(r) if r else None
-    def put(self,name,new_id,old_id,old_name,ts):
-        with conn() as db:db.execute('INSERT OR REPLACE INTO container_backups VALUES(?,?,?,?,?)',(name,new_id,old_id,old_name,ts))
+        with conn() as db:r=db.execute('SELECT new_id,old_id,old_name,created_at,restart_policy FROM container_backups WHERE name=?',(name,)).fetchone()
+        return {**dict(r),'restart_policy':json.loads(r['restart_policy'])} if r else None
+    def put(self,name,new_id,old_id,old_name,ts,restart_policy):
+        with conn() as db:db.execute('INSERT OR REPLACE INTO container_backups VALUES(?,?,?,?,?,?)',(name,new_id,old_id,old_name,ts,json.dumps(restart_policy)))
     def delete(self,name):
         with conn() as db:db.execute('DELETE FROM container_backups WHERE name=?',(name,))
     def rename(self,old,new):
@@ -151,7 +153,7 @@ def redact_env(details):
     env=[e.split('=',1)[0]+'=[REDACTED]' if isinstance(e,str) and '=' in e else e for e in config['Env']]
     return {**details,'Config':{**config,'Env':env}}
 
-def provider():return LocalDockerProvider(os.environ.get('DOCKERFORGE_DOCKER_SOCKET','/var/run/docker.sock'))
+def provider(timeout=8.0):return LocalDockerProvider(os.environ.get('DOCKERFORGE_DOCKER_SOCKET','/var/run/docker.sock'),timeout=timeout)
 
 def create_app():
     initialize()
@@ -460,7 +462,8 @@ def create_app():
             except DockerOperationError:image={}
         except DockerOperationError as exc:fail(exc.code,str(exc),exc.status_code)
         except ValueError:fail('INVALID_CONTAINER','Invalid container identifier',422)
-        spec=container_edit.edit_spec(details,image)
+        try:spec=container_edit.edit_spec(details,image)
+        except (ValueError,TypeError,KeyError):fail('INVALID_CONTAINER','Container settings could not be read for editing',422)
         backup=SqliteBackupStore().get(spec['name'])
         return {**spec,'backup':{'old_name':backup['old_name'],'created_at':backup['created_at']} if backup else None}
 
@@ -469,8 +472,11 @@ def create_app():
         if user['role'] not in ADMINS:fail('FORBIDDEN','Admin required',403)
         update={'RestartPolicy':{'Name':body.restart}}
         # Removing a memory limit needs a recreate; Docker refuses Memory=0 on update.
-        if body.memory_mb:update.update(Memory=body.memory_mb*1024*1024,MemorySwap=-1)
-        if body.nano_cpus is not None:update['NanoCpus']=body.nano_cpus
+        # Swap at twice the memory matches Docker's default for a new limit.
+        if body.memory_mb:update.update(Memory=body.memory_mb*1024*1024,MemorySwap=2*body.memory_mb*1024*1024)
+        if body.nano_cpus is not None:
+            update['NanoCpus']=body.nano_cpus
+            if body.nano_cpus:update.update(CpuQuota=0,CpuPeriod=0)
         return _edit_call(req,user,'container.resources',ident,lambda:provider().update_container(valid_id(ident),update) or {'updated':True})
 
     @app.post('/api/v1/containers/{ident}/rename')
@@ -493,7 +499,7 @@ def create_app():
     @app.post('/api/v1/containers/{ident}/recreate')
     def container_recreate(ident:str,body:container_edit.ContainerEdit,req:Request,user=Depends(require_csrf)):
         if user['role'] not in ADMINS:fail('FORBIDDEN','Admin required',403)
-        return _edit_call(req,user,'container.recreate',ident,lambda:container_edit.recreate(provider(),valid_id(ident),body,SqliteBackupStore(),int(time.time()),settle=RECREATE_SETTLE))
+        return _edit_call(req,user,'container.recreate',ident,lambda:container_edit.recreate(provider(timeout=RECREATE_TIMEOUT),valid_id(ident),body,SqliteBackupStore(),int(time.time()),settle=RECREATE_SETTLE))
 
     @app.post('/api/v1/containers/{ident}/rollback')
     def container_rollback(ident:str,req:Request,user=Depends(require_csrf)):

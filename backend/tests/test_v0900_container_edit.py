@@ -107,7 +107,7 @@ def test_build_body_overlays_edit_and_keeps_hidden_settings():
     assert host['RestartPolicy'] == {'Name': 'unless-stopped'}
     assert host['Memory'] == 256 * 1024 * 1024 and host['NanoCpus'] == 0
     assert host['Privileged'] is False and host['NetworkMode'] == 'bridge'
-    assert extra == ['backend']
+    assert extra == [('backend', {'Aliases': ['web']})]
     assert details == old_details()
 
 
@@ -156,7 +156,8 @@ NOW = 1792224000  # 2026-10-17T08:00:00Z
 class Store:
     def __init__(self): self.rows = {}
     def get(self, name): return self.rows.get(name)
-    def put(self, name, new_id, old_id, old_name, ts): self.rows[name] = {'new_id': new_id, 'old_id': old_id, 'old_name': old_name, 'created_at': ts}
+    def put(self, name, new_id, old_id, old_name, ts, restart_policy):
+        self.rows[name] = {'new_id': new_id, 'old_id': old_id, 'old_name': old_name, 'created_at': ts, 'restart_policy': restart_policy}
     def delete(self, name): self.rows.pop(name, None)
 
 
@@ -169,6 +170,10 @@ class FakeDocker:
         self.fail_start = False
         self.exits_after_start = False
         self.fail_rename = False
+        self.fail_rename_back = False
+        self.fail_stop = False
+        self.fail_delete = None
+        self.pull_errors = set()
         self.counter = 0
 
     def _find(self, ident):
@@ -186,10 +191,16 @@ class FakeDocker:
 
     def pull_image(self, ref):
         self.calls.append(('pull', ref))
+        if ref in self.pull_errors: return '{"status":"Pulling"}\n{"error":"pull access denied"}\n'
         if ref in self.pullable: self.images[ref] = OLD_IMAGE
+        return '{"status":"Downloaded newer image"}\n'
 
     def stop_container(self, ident):
-        self.calls.append(('stop', ident)); self.containers[self._find(ident)]['State']['Running'] = False
+        self.calls.append(('stop', ident))
+        if self.fail_stop:
+            from app.docker.errors import DockerUnavailable
+            raise DockerUnavailable()
+        self.containers[self._find(ident)]['State']['Running'] = False
 
     def start_container(self, ident):
         self.calls.append(('start', ident))
@@ -199,7 +210,8 @@ class FakeDocker:
 
     def rename_container(self, ident, new_name):
         self.calls.append(('rename', ident, new_name))
-        if self.fail_rename: raise DockerOperationError('Docker Engine rejected the operation (HTTP 409)')
+        if self.fail_rename or (self.fail_rename_back and not new_name.startswith('web-old-')):
+            raise DockerOperationError('Docker Engine rejected the operation (HTTP 409)')
         self.containers[self._find(ident)]['Name'] = '/' + new_name
 
     def create_container(self, name, body):
@@ -210,10 +222,14 @@ class FakeDocker:
                                 'HostConfig': body['HostConfig'], 'State': {'Running': False}, 'Mounts': [], 'NetworkSettings': {'Networks': {}}}
         return {'Id': cid}
 
-    def connect_network(self, network, ident): self.calls.append(('connect', network, ident))
+    def connect_network(self, network, ident, endpoint=None): self.calls.append(('connect', network, ident, endpoint))
+
+    def update_container(self, ident, body): self.calls.append(('update', ident, body))
 
     def delete_container(self, ident, *, force=False, remove_volumes=False):
-        self.calls.append(('delete', ident, force, remove_volumes)); del self.containers[self._find(ident)]
+        self.calls.append(('delete', ident, force, remove_volumes))
+        if self.fail_delete: raise DockerOperationError(self.fail_delete)
+        del self.containers[self._find(ident)]
 
     def ops(self): return [c[0] for c in self.calls if c[0] not in ('inspect', 'inspect_image')]
 
@@ -224,10 +240,12 @@ BACKUP = 'web-old-20261017T080000Z'
 def test_recreate_success_keeps_backup():
     d, store = FakeDocker(), Store()
     result = E.recreate(d, 'web', make_edit(image='nginx:1.27'), store, NOW, settle=0)
-    assert d.ops() == ['pull', 'stop', 'rename', 'create', 'connect', 'start']
-    assert ('rename', OLD_ID, BACKUP) in d.calls and ('connect', 'backend', result['id']) in d.calls
+    assert d.ops() == ['pull', 'stop', 'update', 'rename', 'create', 'connect', 'start']
+    assert ('update', OLD_ID, {'RestartPolicy': {'Name': 'no'}}) in d.calls
+    assert ('rename', OLD_ID, BACKUP) in d.calls and ('connect', 'backend', result['id'], {'Aliases': ['web']}) in d.calls
     assert result == {'id': result['id'], 'name': 'web', 'backup': BACKUP}
-    assert store.get('web') == {'new_id': result['id'], 'old_id': OLD_ID, 'old_name': BACKUP, 'created_at': NOW}
+    assert store.get('web') == {'new_id': result['id'], 'old_id': OLD_ID, 'old_name': BACKUP, 'created_at': NOW,
+                                'restart_policy': {'Name': 'always', 'MaximumRetryCount': 0}}
     assert d.containers[result['id']]['State']['Running'] is True
 
 
@@ -286,7 +304,7 @@ def test_recreate_rename_failure_restarts_old():
     d.fail_rename = True
     with pytest.raises(E.EditError):
         E.recreate(d, 'web', make_edit(), Store(), NOW, settle=0)
-    assert d.ops() == ['stop', 'rename', 'start'] and d.containers[OLD_ID]['State']['Running'] is True
+    assert d.ops() == ['stop', 'update', 'rename', 'update', 'start'] and d.containers[OLD_ID]['State']['Running'] is True
 
 
 def test_second_recreate_replaces_previous_backup():
@@ -337,7 +355,6 @@ from app.core import create_app
 
 
 class ApiDocker(FakeDocker):
-    def update_container(self, ident, body): self.calls.append(('update', ident, body))
     def disconnect_network(self, network, ident): self.calls.append(('disconnect', network, ident))
 
 
@@ -346,7 +363,9 @@ def api(tmp_path, monkeypatch):
     monkeypatch.setenv('DOCKERFORGE_DB', str(tmp_path / 'edit.db'))
     monkeypatch.setenv('DOCKERFORGE_SETUP_TOKEN', 'bootstrap')
     docker = ApiDocker()
-    monkeypatch.setattr(core, 'provider', lambda: docker)
+    provider_kwargs = []
+    monkeypatch.setattr(core, 'provider', lambda **kw: (provider_kwargs.append(kw), docker)[1])
+    docker.provider_kwargs = provider_kwargs
     monkeypatch.setattr(core, 'RECREATE_SETTLE', 0)
     app = create_app()
     setup = TestClient(app, base_url='https://testserver')
@@ -428,7 +447,10 @@ def test_recreate_error_maps_to_status(api):
 def test_live_edits_call_docker(api):
     admin, _, docker = api
     assert admin.post('/api/v1/containers/web/resources', json={'memory_mb': 256, 'nano_cpus': 500000000, 'restart': 'always'}).status_code == 200
-    assert ('update', 'web', {'RestartPolicy': {'Name': 'always'}, 'Memory': 256 * 1024 * 1024, 'MemorySwap': -1, 'NanoCpus': 500000000}) in docker.calls
+    assert ('update', 'web', {'RestartPolicy': {'Name': 'always'}, 'Memory': 256 * 1024 * 1024, 'MemorySwap': 512 * 1024 * 1024,
+                              'NanoCpus': 500000000, 'CpuQuota': 0, 'CpuPeriod': 0}) in docker.calls
+    assert admin.post('/api/v1/containers/web/resources', json={'restart': 'no'}).status_code == 200
+    assert docker.calls[-1] == ('update', 'web', {'RestartPolicy': {'Name': 'no'}})
     assert admin.post('/api/v1/containers/web/rename', json={'name': 'web2'}).status_code == 200
     assert ('rename', 'web', 'web2') in docker.calls
     assert admin.post('/api/v1/containers/web2/networks/backend/disconnect').status_code == 200
@@ -458,3 +480,156 @@ def test_ui_edit_workspace_uses_text_content_only():
     start = HTML.index('function setupEditWorkspace(')
     end = HTML.index('\n', HTML.index('async function removeBackup('))
     assert 'innerHTML' not in HTML[start:end]
+
+
+# --- final review fixes ---
+
+def test_recreate_refuses_auto_remove_containers():
+    d = FakeDocker()
+    d.containers[OLD_ID]['HostConfig']['AutoRemove'] = True
+    with pytest.raises(E.EditError) as err:
+        E.recreate(d, 'web', make_edit(), Store(), NOW, settle=0)
+    assert err.value.code == 'AUTO_REMOVE' and err.value.status == 409 and d.ops() == []
+
+
+def test_memory_change_resets_swap_and_reservation():
+    details = old_details()
+    details['HostConfig'].update(Memory=512 * 2**20, MemorySwap=1024 * 2**20, MemoryReservation=400 * 2**20)
+    body, _ = E.build_create_body(details, OLD_IMAGE, make_edit(memory_mb=2048))
+    assert body['HostConfig']['MemorySwap'] == 0 and body['HostConfig']['MemoryReservation'] == 400 * 2**20
+    body, _ = E.build_create_body(details, OLD_IMAGE, make_edit(memory_mb=256))
+    assert body['HostConfig']['MemoryReservation'] == 0
+    body, _ = E.build_create_body(details, OLD_IMAGE, make_edit(memory_mb=512))
+    assert body['HostConfig']['MemorySwap'] == 1024 * 2**20
+
+
+def test_nano_cpus_clears_cpu_quota():
+    details = old_details()
+    details['HostConfig'].update(CpuQuota=50000, CpuPeriod=100000)
+    body, _ = E.build_create_body(details, OLD_IMAGE, make_edit(nano_cpus=10**9))
+    assert (body['HostConfig']['NanoCpus'], body['HostConfig']['CpuQuota'], body['HostConfig']['CpuPeriod']) == (10**9, 0, 0)
+    body, _ = E.build_create_body(details, OLD_IMAGE, make_edit())
+    assert body['HostConfig']['CpuQuota'] == 50000
+
+
+def test_failed_recreate_restores_backup_restart_policy():
+    d = FakeDocker()
+    d.fail_start = True
+    with pytest.raises(E.EditError):
+        E.recreate(d, 'web', make_edit(), Store(), NOW, settle=0)
+    updates = [c for c in d.calls if c[0] == 'update']
+    assert updates == [('update', OLD_ID, {'RestartPolicy': {'Name': 'no'}}),
+                       ('update', OLD_ID, {'RestartPolicy': {'Name': 'always', 'MaximumRetryCount': 0}})]
+
+
+def test_rollback_restores_restart_policy():
+    d, store = FakeDocker(), Store()
+    E.recreate(d, 'web', make_edit(), store, NOW, settle=0)
+    E.rollback(d, 'web', store)
+    assert d.calls[-2:] == [('update', OLD_ID, {'RestartPolicy': {'Name': 'always', 'MaximumRetryCount': 0}}), ('start', OLD_ID)]
+
+
+def test_restore_continues_when_delete_of_new_fails():
+    d = FakeDocker()
+    d.fail_start = True
+    d.fail_delete = 'Docker Engine rejected the operation (HTTP 500)'
+    with pytest.raises(E.EditError) as err:
+        E.recreate(d, 'web', make_edit(), Store(), NOW, settle=0)
+    assert err.value.code == 'RECREATE_FAILED'
+    assert d.containers[OLD_ID]['Name'] == '/web' and d.containers[OLD_ID]['State']['Running'] is True
+
+
+def test_restore_failure_is_reported_with_backup_name():
+    d = FakeDocker()
+    d.fail_start = True
+    d.fail_rename_back = True
+    with pytest.raises(E.EditError) as err:
+        E.recreate(d, 'web', make_edit(), Store(), NOW, settle=0)
+    assert err.value.code == 'RESTORE_FAILED' and BACKUP in err.value.message
+
+
+def test_stop_failure_changes_nothing_else():
+    d = FakeDocker()
+    d.fail_stop = True
+    with pytest.raises(E.EditError) as err:
+        E.recreate(d, 'web', make_edit(), Store(), NOW, settle=0)
+    assert err.value.code == 'RECREATE_FAILED' and 'rename' not in d.ops() and 'create' not in d.ops()
+
+
+def test_random_and_ipv6_ports_round_trip():
+    details = old_details()
+    details['HostConfig']['PortBindings'] = {'80/tcp': [{'HostIp': '', 'HostPort': ''}, {'HostIp': '::', 'HostPort': '8443'}]}
+    spec = E.edit_spec(details, OLD_IMAGE)
+    assert spec['port_bindings'] == [{'host_ip': '', 'host_port': None, 'container_port': 80, 'protocol': 'tcp'},
+                                     {'host_ip': '::', 'host_port': 8443, 'container_port': 80, 'protocol': 'tcp'}]
+    body, _ = E.build_create_body(details, OLD_IMAGE, make_edit(port_bindings=spec['port_bindings'], acknowledge_public_ports=True))
+    assert body['HostConfig']['PortBindings'] == {'80/tcp': [{'HostIp': '', 'HostPort': ''}, {'HostIp': '::', 'HostPort': '8443'}]}
+
+
+def test_with_default_tag():
+    assert E.with_default_tag('nginx') == 'nginx:latest'
+    assert E.with_default_tag('registry:5000/app') == 'registry:5000/app:latest'
+    assert E.with_default_tag('nginx:1.27') == 'nginx:1.27'
+    assert E.with_default_tag('img@sha256:' + 'a' * 64) == 'img@sha256:' + 'a' * 64
+
+
+def test_update_image_fails_when_pull_reports_error():
+    d = FakeDocker()
+    d.pull_errors.add('nginx:1.25')
+    with pytest.raises(E.EditError) as err:
+        E.recreate(d, 'web', make_edit(pull=True), Store(), NOW, settle=0)
+    assert err.value.code == 'IMAGE_UNAVAILABLE' and 'stop' not in d.ops()
+
+
+def test_pull_adds_latest_tag():
+    d = FakeDocker()
+    d.images['nginx:latest'] = OLD_IMAGE
+    E.recreate(d, 'web', make_edit(image='nginx'), Store(), NOW, settle=0)
+    assert ('pull', 'nginx:latest') in d.calls
+
+
+def test_network_endpoints_are_kept():
+    details = old_details()
+    details['NetworkSettings']['Networks'] = {
+        'bridge': {'Aliases': None, 'MacAddress': '02:42:ac:11:00:02', 'IPAMConfig': None, 'NetworkID': 'n1'},
+        'backend': {'Aliases': ['web', OLD_ID[:12]], 'IPAMConfig': {'IPv4Address': '172.20.0.5'}, 'Links': None,
+                    'DriverOpts': None, 'NetworkID': 'n2'}}
+    body, extra = E.build_create_body(details, OLD_IMAGE, make_edit())
+    assert body['NetworkingConfig'] == {'EndpointsConfig': {'bridge': {'MacAddress': '02:42:ac:11:00:02'}}}
+    assert extra == [('backend', {'Aliases': ['web'], 'IPAMConfig': {'IPv4Address': '172.20.0.5'}})]
+    details['HostConfig']['NetworkMode'] = 'n2'
+    body, extra = E.build_create_body(details, OLD_IMAGE, make_edit())
+    assert list(body['NetworkingConfig']['EndpointsConfig']) == ['backend'] and [n for n, _ in extra] == ['bridge']
+
+
+def test_image_default_runtime_settings_follow_new_image():
+    image = copy.deepcopy(OLD_IMAGE)
+    image['Config'].update(WorkingDir='/srv', Healthcheck={'Test': ['CMD', 'true']}, StopSignal='SIGQUIT')
+    details = old_details()
+    details['Config']['StopSignal'] = 'SIGQUIT'
+    body, _ = E.build_create_body(details, image, make_edit())
+    assert 'WorkingDir' not in body and 'Healthcheck' not in body and 'StopSignal' not in body
+    assert body['User'] == 'app'
+
+
+def test_remove_backup_reports_docker_errors():
+    d, store = FakeDocker(), Store()
+    E.recreate(d, 'web', make_edit(), store, NOW, settle=0)
+    d.fail_delete = 'Docker Engine is unavailable'
+    with pytest.raises(E.EditError):
+        E.remove_backup(d, 'web', store)
+    assert store.get('web') is not None
+    d.fail_delete = 'Docker Engine rejected the operation (HTTP 404)'
+    assert E.remove_backup(d, 'web', store) == {'removed': BACKUP} and store.get('web') is None
+
+
+def test_recreate_route_uses_long_docker_timeout(api):
+    admin, _, docker = api
+    assert admin.post('/api/v1/containers/web/recreate', json=edit_body()).status_code == 200
+    assert any(kw.get('timeout', 0) >= 300 for kw in docker.provider_kwargs)
+
+
+def test_edit_spec_route_handles_random_ports(api):
+    admin, _, docker = api
+    docker.containers[OLD_ID]['HostConfig']['PortBindings'] = {'80/tcp': [{'HostIp': '', 'HostPort': ''}]}
+    assert admin.get('/api/v1/containers/web/edit').status_code == 200

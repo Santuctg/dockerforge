@@ -140,8 +140,10 @@ class LocalDockerProvider(DockerProvider):
     def rename_container(self, ident: str, new_name: str):
         return self._call('POST', '/containers/' + valid_id(ident) + '/rename?' + urlencode({'name': valid_id(new_name)}))
 
-    def connect_network(self, network: str, ident: str):
-        return self._call('POST', '/networks/' + valid_id(network) + '/connect', body={'Container': valid_id(ident)})
+    def connect_network(self, network: str, ident: str, endpoint: dict | None = None):
+        body = {'Container': valid_id(ident)}
+        if endpoint: body['EndpointConfig'] = endpoint
+        return self._call('POST', '/networks/' + valid_id(network) + '/connect', body=body)
 
     def disconnect_network(self, network: str, ident: str):
         return self._call('POST', '/networks/' + valid_id(network) + '/disconnect', body={'Container': valid_id(ident), 'Force': False})
