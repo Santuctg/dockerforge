@@ -76,3 +76,34 @@ port_in_use() {
   command -v ss >/dev/null 2>&1 || return 1
   [[ -n $(ss -ltnH "sport = :$1" 2>/dev/null) ]]
 }
+
+# Public IPv4 as seen from the internet (empty if it cannot be determined).
+public_ip() {
+  local ip url
+  for url in https://api.ipify.org https://ifconfig.me; do
+    ip=$(curl -4 -fsS --max-time 5 "$url" 2>/dev/null) || continue
+    if [[ $ip =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then echo "$ip"; return 0; fi
+  done
+  return 0
+}
+
+# dns_check <domain> "<resolved ips>" <public ip>: fail early if Let's Encrypt cannot reach us.
+dns_check() {
+  local domain=$1 resolved=$2 public=$3 ip target
+  if [[ -z ${resolved// /} ]]; then
+    target=${public:-"<this server's public IP>"}
+    echo "ERROR: $domain has no DNS A/AAAA record." >&2
+    echo "Add an A record: $domain -> $target, wait for DNS to update, then re-run." >&2
+    return 1
+  fi
+  if [[ -z $public ]]; then
+    echo "Warning: could not detect this server's public IP; $domain resolves to: $resolved" >&2
+    return 0
+  fi
+  for ip in $resolved; do
+    if [[ $ip == "$public" ]]; then return 0; fi
+  done
+  echo "ERROR: $domain points to $resolved, but this server's public IP is $public." >&2
+  echo "Update the A record to $public (with Cloudflare, use 'DNS only'), or re-run with --skip-dns-check if this is intended." >&2
+  return 1
+}

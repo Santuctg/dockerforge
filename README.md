@@ -21,7 +21,7 @@ sudo bash installer/install.sh --check                                          
 
 The installer installs Python 3.11+, Docker with Compose (asks first; `--yes` to skip the question), creates the `dockerforge` service user, a TLS certificate, and starts the panel on `https://<host>:9443`. It prints a one-time setup token: open the URL, enter the token and create the Super Admin.
 
-- Let's Encrypt needs a DNS name pointing at the server and port 80 reachable; renewals are automatic and restart the panel.
+- Let's Encrypt needs a DNS A record pointing at the server and port 80 reachable; renewals are automatic and restart the panel. Before changing anything the installer checks that the domain resolves to this server's public IP (`--skip-dns-check` to bypass, e.g. behind NAT). Test with `sudo bash installer/install.sh --check --domain <name> --email <address>`.
 - Re-running is safe: database, users, config, setup token and certificates are kept, and the previous version is backed up to `/root/dockerforge-install-backup-<time>`. A failed run restores it.
 - `sudo bash installer/uninstall.sh` removes services and code but keeps data; add `--purge` to delete data, config and backups too. Docker and your containers are never touched.
 - The `dockerforge` user is in the `docker` group, which is root-equivalent. Restrict port 9443 to trusted IPs or a VPN.

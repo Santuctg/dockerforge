@@ -21,7 +21,7 @@ STEPS=(step_preflight step_packages step_docker step_user_dirs step_app
        step_config step_firewall step_tls step_services step_verify)
 SYSTEMD_DIR=/etc/systemd/system
 
-DOMAIN='' EMAIL='' ASSUME_YES=0 NO_FIREWALL=0 CHECK_ONLY=0
+DOMAIN='' EMAIL='' ASSUME_YES=0 NO_FIREWALL=0 CHECK_ONLY=0 SKIP_DNS=0
 FAMILY='' OS_ID='' PY='' BACKUP='' STAGING='' APP_SWAPPED=0 DONE=0
 
 usage() {
@@ -32,6 +32,7 @@ Usage: sudo bash installer/install.sh [options]
   --email ADDRESS  Contact address for Let's Encrypt (required with --domain)
   --yes            Install Docker without asking if it is missing
   --no-firewall    Do not open ports in ufw/firewalld
+  --skip-dns-check Do not check that --domain points to this server
   --check          Run preflight checks only; change nothing
   --help           Show this help
 
@@ -47,6 +48,7 @@ parse_args() {
       --email) [[ $# -ge 2 ]] || { echo '--email needs a value' >&2; exit 2; }; EMAIL=$2; shift ;;
       --yes) ASSUME_YES=1 ;;
       --no-firewall) NO_FIREWALL=1 ;;
+      --skip-dns-check) SKIP_DNS=1 ;;
       --check) CHECK_ONLY=1 ;;
       --help|-h) usage; exit 0 ;;
       *) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
@@ -84,6 +86,12 @@ step_preflight() {
   if PY=$(find_python); then echo "Python: $PY"; else echo 'Python 3.11+: not found, will be installed'; fi
   if port_in_use 9443 && ! systemctl is-active --quiet dockerforge; then
     die 'Port 9443 is already in use by another program'
+  fi
+  if [[ -n $DOMAIN && $SKIP_DNS -ne 1 && ! -d /etc/letsencrypt/live/$DOMAIN ]]; then
+    local resolved
+    resolved=$(getent ahosts "$DOMAIN" 2>/dev/null | awk '{print $1}' | sort -u | tr '\n' ' ') || true
+    dns_check "$DOMAIN" "$resolved" "$(public_ip)" || exit 1
+    echo "DNS: $DOMAIN -> $resolved"
   fi
   if [[ -n $DOMAIN && ! -d /etc/letsencrypt/live/$DOMAIN ]] && port_in_use 80; then
     die 'Port 80 is in use; Let'"'"'s Encrypt needs it free to issue the certificate'

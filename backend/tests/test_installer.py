@@ -275,3 +275,31 @@ def test_service_user_gets_own_group(tmp_path):
                               {'getent': 'exit 2', 'useradd': 'exit 0', 'usermod': 'exit 0'})
     useradd = next(l for l in calls.splitlines() if l.startswith('useradd'))
     assert '--user-group' in useradd.split() or '-U' in useradd.split()
+
+
+# --- DNS preflight for --domain ---
+
+def test_dns_check_no_record():
+    r = sh('dns_check docker.example.com "" 203.0.113.7')
+    assert r.returncode == 1
+    assert 'no DNS A/AAAA record' in r.stderr and '203.0.113.7' in r.stderr
+
+
+def test_dns_check_points_elsewhere():
+    r = sh('dns_check docker.example.com "198.51.100.1" 203.0.113.7')
+    assert r.returncode == 1
+    assert '198.51.100.1' in r.stderr and '203.0.113.7' in r.stderr and '--skip-dns-check' in r.stderr
+
+
+def test_dns_check_matches():
+    assert sh('dns_check docker.example.com "198.51.100.1 203.0.113.7" 203.0.113.7').returncode == 0
+
+
+def test_dns_check_unknown_public_ip_passes_with_warning():
+    r = sh('dns_check docker.example.com "198.51.100.1" ""')
+    assert r.returncode == 0
+    assert 'Warning' in r.stderr
+
+
+def test_install_help_mentions_skip_dns_check():
+    assert '--skip-dns-check' in run_script(INSTALL, '--help').stdout
