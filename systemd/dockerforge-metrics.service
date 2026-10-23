@@ -1,0 +1,23 @@
+[Unit]
+Description=DockerForge Container Metrics Collector
+After=docker.service
+Wants=docker.service
+
+[Service]
+Type=simple
+User=dockerforge
+Group=dockerforge
+WorkingDirectory=/opt/dockerforge/backend
+EnvironmentFile=-/etc/dockerforge/dockerforge.env
+ExecStart=/opt/dockerforge/venv/bin/python -m app.monitoring.collector
+Restart=always
+RestartSec=5
+TimeoutStopSec=15
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/dockerforge
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
