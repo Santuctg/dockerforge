@@ -1,0 +1,23 @@
+[Unit]
+Description=DockerForge Web Panel
+After=network-online.target docker.service
+Wants=network-online.target docker.service
+
+[Service]
+Type=simple
+User=dockerforge
+Group=dockerforge
+WorkingDirectory=/opt/dockerforge/backend
+EnvironmentFile=/etc/dockerforge/dockerforge.env
+ExecStart=/opt/dockerforge/venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 9443 --ssl-certfile /etc/dockerforge/tls/fullchain.pem --ssl-keyfile /etc/dockerforge/tls/privkey.pem
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=15
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/dockerforge
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
