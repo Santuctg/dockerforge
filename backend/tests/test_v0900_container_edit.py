@@ -328,3 +328,109 @@ def test_remove_backup_keeps_volumes():
     E.recreate(d, 'web', make_edit(), store, NOW, settle=0)
     assert E.remove_backup(d, 'web', store) == {'removed': BACKUP}
     assert ('delete', OLD_ID, True, False) in d.calls and store.rows == {}
+
+
+# --- Task 4: API ---
+from fastapi.testclient import TestClient
+import app.core as core
+from app.core import create_app
+
+
+class ApiDocker(FakeDocker):
+    def update_container(self, ident, body): self.calls.append(('update', ident, body))
+    def disconnect_network(self, network, ident): self.calls.append(('disconnect', network, ident))
+
+
+@pytest.fixture
+def api(tmp_path, monkeypatch):
+    monkeypatch.setenv('DOCKERFORGE_DB', str(tmp_path / 'edit.db'))
+    monkeypatch.setenv('DOCKERFORGE_SETUP_TOKEN', 'bootstrap')
+    docker = ApiDocker()
+    monkeypatch.setattr(core, 'provider', lambda: docker)
+    monkeypatch.setattr(core, 'RECREATE_SETTLE', 0)
+    app = create_app()
+    setup = TestClient(app, base_url='https://testserver')
+    assert setup.post('/api/v1/auth/setup', json={'username': 'super1', 'password': 'very-long-password'},
+                      headers={'X-Setup-Token': 'bootstrap'}).status_code == 201
+
+    def login(username, password):
+        c = TestClient(app, base_url='https://testserver')
+        csrf = c.get('/api/v1/auth/csrf').json()['csrf_token']
+        r = c.post('/api/v1/auth/login', json={'username': username, 'password': password}, headers={'X-CSRF-Token': csrf})
+        assert r.status_code == 200, r.text
+        c.headers['X-CSRF-Token'] = r.json()['csrf_token']
+        return c
+
+    admin = login('super1', 'very-long-password')
+
+    def as_role(role):
+        assert admin.post('/api/v1/users', json={'username': role + '1', 'password': 'role-long-password', 'role': role}).status_code == 201
+        return login(role + '1', 'role-long-password')
+
+    return admin, as_role, docker
+
+
+def edit_body(**over):
+    spec = E.edit_spec(old_details(), OLD_IMAGE)
+    body = {k: spec[k] for k in ('image', 'command', 'environment', 'port_bindings', 'mounts', 'restart', 'memory_mb', 'nano_cpus')}
+    body['acknowledge_high_risk'] = True
+    body.update(over)
+    return body
+
+
+EDIT_ROUTES = [('get', '/api/v1/containers/web/edit', None), ('post', '/api/v1/containers/web/resources', {'restart': 'always'}),
+               ('post', '/api/v1/containers/web/rename', {'name': 'web2'}), ('post', '/api/v1/containers/web/recreate', edit_body()),
+               ('post', '/api/v1/containers/web/rollback', None), ('delete', '/api/v1/containers/web/backup', None),
+               ('post', '/api/v1/containers/web/networks/backend/connect', None)]
+
+
+def test_edit_routes_are_admin_only(api):
+    _, as_role, _ = api
+    for role in ('viewer', 'operator'):
+        client = as_role(role)
+        for method, path, body in EDIT_ROUTES:
+            r = getattr(client, method)(path, **({'json': body} if body is not None else {}))
+            assert r.status_code == 403, (role, path, r.status_code)
+
+
+def test_edit_writes_need_csrf(api):
+    admin, _, _ = api
+    admin.headers.pop('X-CSRF-Token')
+    assert admin.post('/api/v1/containers/web/rename', json={'name': 'web2'}).status_code == 403
+
+
+def test_get_edit_spec(api):
+    admin, _, _ = api
+    data = admin.get('/api/v1/containers/web/edit').json()
+    assert data['environment'] == {'API_KEY': 'k1'} and data['backup'] is None and data['compose_project'] is None
+
+
+def test_recreate_rollback_and_backup_via_api(api):
+    admin, _, docker = api
+    r = admin.post('/api/v1/containers/web/recreate', json=edit_body(environment={'API_KEY': 'k2'}))
+    assert r.status_code == 200, r.text
+    new_id = r.json()['id']
+    assert admin.get('/api/v1/containers/web/edit').json()['backup']['old_name'].startswith('web-old-')
+    assert admin.post('/api/v1/containers/web/rollback').json()['id'] == OLD_ID
+    assert new_id not in docker.containers
+    assert admin.delete('/api/v1/containers/web/backup').status_code == 404
+    actions = [row['action'] for row in admin.get('/api/v1/audit').json()['items']]
+    assert 'container.recreate' in actions and 'container.rollback' in actions
+
+
+def test_recreate_error_maps_to_status(api):
+    admin, _, docker = api
+    docker.containers[OLD_ID]['Config']['Labels']['com.docker.compose.project'] = 'df_shop'
+    r = admin.post('/api/v1/containers/web/recreate', json=edit_body())
+    assert r.status_code == 409 and r.json()['error']['code'] == 'COMPOSE_MANAGED'
+
+
+def test_live_edits_call_docker(api):
+    admin, _, docker = api
+    assert admin.post('/api/v1/containers/web/resources', json={'memory_mb': 256, 'nano_cpus': 500000000, 'restart': 'always'}).status_code == 200
+    assert ('update', 'web', {'RestartPolicy': {'Name': 'always'}, 'Memory': 256 * 1024 * 1024, 'MemorySwap': -1, 'NanoCpus': 500000000}) in docker.calls
+    assert admin.post('/api/v1/containers/web/rename', json={'name': 'web2'}).status_code == 200
+    assert ('rename', 'web', 'web2') in docker.calls
+    assert admin.post('/api/v1/containers/web2/networks/backend/disconnect').status_code == 200
+    assert ('disconnect', 'backend', 'web2') in docker.calls
+    assert admin.post('/api/v1/containers/web2/networks/host/connect').status_code == 422
