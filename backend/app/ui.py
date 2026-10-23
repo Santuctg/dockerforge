@@ -261,7 +261,7 @@ async function viewContainerDetails(id,name,state,tab='overview'){
   if(['overview','configuration','network','mounts','raw'].includes(tab)){
    const data=await call('containers/'+encodeURIComponent(id));content.replaceChildren();renderInspectDetails(content,data,tab);
   }else if(tab==='logs'){
-   await setupLogWorkspace(content,id);
+   if(!canOperate())content.textContent='Operator permission required.';else await setupLogWorkspace(content,id);
   }else if(tab==='stats'){
    const value=await call('containers/'+encodeURIComponent(id)+'/metrics');content.replaceChildren();
    content.append(detailsGroup('Live statistics',[['CPU',String(value.cpu_percent??'—')+'%'],['Memory',bytesHuman(value.memory_usage_bytes)],['Memory percent',String(value.memory_percent??'—')+'%'],['Network RX',String(value.network_rx_bytes??'—')+' bytes'],['Network TX',String(value.network_tx_bytes??'—')+' bytes']]));

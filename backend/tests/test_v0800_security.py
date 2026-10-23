@@ -67,3 +67,22 @@ def test_inspect_without_env_ok(make_client, monkeypatch):
     for details in ({'Id': 'abc'}, {'Id': 'abc', 'Config': {'Env': None}}):
         monkeypatch.setattr(FakeProvider, 'details', details)
         assert viewer.get('/api/v1/containers/abc').status_code == 200
+
+
+def test_logs_forbidden_for_viewer(make_client, monkeypatch):
+    _, as_role = make_client
+    monkeypatch.setattr(core, 'fetch_logs', lambda ident, tail, ts: {'output': 'secret line', 'truncated': False})
+    r = as_role('viewer').get('/api/v1/containers/abc/logs')
+    assert r.status_code == 403
+    assert 'secret line' not in r.text
+
+
+def test_logs_allowed_for_operator(make_client, monkeypatch):
+    _, as_role = make_client
+    monkeypatch.setattr(core, 'fetch_logs', lambda ident, tail, ts: {'output': 'line', 'truncated': False})
+    assert as_role('operator').get('/api/v1/containers/abc/logs').json()['output'] == 'line'
+
+
+def test_ui_hides_logs_tab_from_viewers():
+    from app.ui import HTML
+    assert "if(!canOperate())content.textContent='Operator permission required.';else await setupLogWorkspace(content,id);" in HTML

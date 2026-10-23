@@ -383,7 +383,8 @@ def create_app():
         return result
 
     @app.get('/api/v1/containers/{ident}/logs')
-    def container_logs(ident:str,tail:int=100,timestamps:bool=False,user=Depends(require_role(READ))):
+    def container_logs(ident:str,tail:int=100,timestamps:bool=False,user=Depends(require_role(OPS))):
+        # Logs routinely contain credentials; viewers get status and metrics only.
         try:return fetch_logs(ident,tail,timestamps)
         except ValueError:fail('INVALID_REQUEST','Invalid container or tail count',422)
         except RuntimeError:fail('DOCKER_LOGS_FAILED','Unable to retrieve container logs',502)
