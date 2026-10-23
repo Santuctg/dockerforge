@@ -30,4 +30,14 @@ The installer installs Python 3.11+, Docker with Compose (asks first; `--yes` to
 
 Windows and macOS are not supported (systemd and a Unix Docker socket are required).
 
+## Editing containers
+
+Admins get an **Edit** tab in container details.
+
+- **Live settings** apply immediately without a restart: memory and CPU limits, restart policy, rename, and connect/disconnect networks. Removing a memory limit entirely needs a recreate.
+- **Edit & recreate** changes the image/tag, command, environment, ports and mounts. DockerForge keeps every setting the form does not show (labels, user, working dir, healthcheck, privileged/devices, network mode), stops the old container, renames it `<name>-old-<time>`, and starts a new one under the original name. If the new container does not start, or exits within 3 seconds, it is removed and the old one is restored. Volumes, including anonymous ones, stay attached, and data is never deleted.
+- **Update image** pulls the image again and recreates with the same settings.
+- The old container is kept, stopped, as a **backup**: **Roll back** brings it back, and **Remove backup** deletes it (volumes are kept). A new recreate replaces the previous backup.
+- Containers that belong to a Docker Compose project can't be recreated here. Edit the stack instead, so the next deploy keeps the change. Live settings still work on them.
+
 **Limitations:** no Web backup execution or restore; no root helper; no verified backup state exposed; no encrypted offsite storage. Independent security review pending.
