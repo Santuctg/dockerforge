@@ -1,9 +1,11 @@
 """Edit and recreate existing containers: overlay edits on the old container's settings."""
 import copy
 import re
+import time
 from typing import Literal
 from pydantic import BaseModel, Field, field_validator
 from .containers import IMAGE_RE, PortBinding
+from .errors import DockerOperationError
 
 MOUNT_RE = re.compile(r'^(/[^:]+|[A-Za-z0-9][A-Za-z0-9_.-]*):(/[^:]*)(:(ro|rw))?$')
 COMPOSE_LABEL = 'com.docker.compose.project'
@@ -124,3 +126,99 @@ def is_high_risk(body):
     host = body.get('HostConfig') or {}
     return bool(host.get('Privileged') or host.get('NetworkMode') == 'host' or host.get('PidMode') == 'host'
                 or host.get('Devices') or host.get('CapAdd') or any(b.startswith('/') for b in host.get('Binds') or []))
+
+
+class EditError(Exception):
+    def __init__(self, code, message, status):
+        super().__init__(message)
+        self.code, self.message, self.status = code, message, status
+
+
+def _exists(p, ident):
+    try:
+        p.inspect_container(ident)
+        return True
+    except DockerOperationError:
+        return False
+
+
+def recreate(p, ident, edit, store, now, settle=3.0):
+    """Replace a container with an edited copy; restore the old one if the new one does not run."""
+    details = p.inspect_container(ident)
+    if compose_project(details):
+        raise EditError('COMPOSE_MANAGED', 'Container is managed by Docker Compose; edit its stack instead', 409)
+    name, old_id = (details.get('Name') or '').lstrip('/'), details['Id']
+    config = details.get('Config') or {}
+    try: old_image = p.inspect_image(details.get('Image') or config.get('Image'))
+    except DockerOperationError: old_image = {}
+    try: body, extra = build_create_body(details, old_image, edit)
+    except ValueError as exc: raise EditError('INVALID_EDIT', str(exc), 422) from exc
+    if is_high_risk(body) and not edit.acknowledge_high_risk:
+        raise EditError('HIGH_RISK_CONFIRMATION_REQUIRED', 'Explicit acknowledgement required for host-level Docker options', 403)
+    if edit.pull or edit.image != config.get('Image'):
+        try: p.pull_image(edit.image)
+        except DockerOperationError: pass
+        try: p.inspect_image(edit.image)
+        except DockerOperationError as exc: raise EditError('IMAGE_UNAVAILABLE', 'Image could not be pulled', 422) from exc
+    backup = name[:100] + '-old-' + time.strftime('%Y%m%dT%H%M%SZ', time.gmtime(now))
+    if _exists(p, backup): raise EditError('INVALID_EDIT', 'Backup name already in use; retry in a second', 409)
+    was_running = bool((details.get('State') or {}).get('Running'))
+    if was_running: p.stop_container(old_id)
+    try:
+        p.rename_container(old_id, backup)
+    except DockerOperationError as exc:
+        if was_running: p.start_container(old_id)
+        raise EditError('RECREATE_FAILED', 'Could not set the previous container aside; it was restarted', 502) from exc
+    new_id = None
+    try:
+        new_id = p.create_container(name, body)['Id']
+        for network in extra: p.connect_network(network, new_id)
+        if was_running:
+            p.start_container(new_id)
+            if settle: time.sleep(settle)
+            state = p.inspect_container(new_id).get('State') or {}
+            if not state.get('Running') or state.get('Restarting'): raise RuntimeError('new container is not running')
+    except Exception as exc:
+        try:
+            if new_id: p.delete_container(new_id, force=True, remove_volumes=False)
+            p.rename_container(old_id, name)
+            if was_running: p.start_container(old_id)
+        except DockerOperationError:
+            pass
+        raise EditError('RECREATE_FAILED', 'New container failed to start; the previous container was restored', 502) from exc
+    previous = store.get(name)
+    if previous:
+        try: p.delete_container(previous['old_id'], force=True, remove_volumes=False)
+        except DockerOperationError: pass
+    store.put(name, new_id, old_id, backup, now)
+    return {'id': new_id, 'name': name, 'backup': backup}
+
+
+def rollback(p, name, store):
+    row = store.get(name)
+    if not row: raise EditError('NO_BACKUP', 'No backup for this container', 404)
+    if not _exists(p, row['old_id']):
+        store.delete(name)
+        raise EditError('NO_BACKUP', 'Backup container no longer exists', 409)
+    running = False
+    try:
+        current = p.inspect_container(name)
+        if current['Id'] != row['new_id']:
+            raise EditError('INVALID_EDIT', 'Container was replaced since the backup was made', 409)
+        running = bool((current.get('State') or {}).get('Running'))
+        p.delete_container(current['Id'], force=True, remove_volumes=False)
+    except DockerOperationError:
+        pass
+    p.rename_container(row['old_id'], name)
+    if running: p.start_container(row['old_id'])
+    store.delete(name)
+    return {'id': row['old_id'], 'name': name}
+
+
+def remove_backup(p, name, store):
+    row = store.get(name)
+    if not row: raise EditError('NO_BACKUP', 'No backup for this container', 404)
+    try: p.delete_container(row['old_id'], force=True, remove_volumes=False)
+    except DockerOperationError: pass
+    store.delete(name)
+    return {'removed': row['old_name']}
