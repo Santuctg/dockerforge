@@ -7,10 +7,22 @@ from typing import Literal
 
 IDENT_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$')
 IMAGE_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_.:/@-]{0,254}$')
+LOOPBACK_IPS = frozenset({'127.0.0.1', '::1'})
 
 def valid_id(value: str) -> str:
     if not IDENT_RE.fullmatch(value):raise ValueError('Invalid Docker container identifier')
     return value
+
+def normalize_host_ip(value: str) -> str:
+    """Validate a bind address. '' (or '*') means all interfaces, IPv4 and IPv6."""
+    value = (value or '').strip()
+    if value in ('', '*'):
+        return ''
+    return str(ip_address(value))
+
+def is_public_host_ip(value: str) -> bool:
+    """True unless the address is a loopback address. Wildcards listen everywhere."""
+    return normalize_host_ip(value) not in LOOPBACK_IPS
 
 class PortBinding(BaseModel):
     host_ip: str = '127.0.0.1'
@@ -21,10 +33,7 @@ class PortBinding(BaseModel):
     @field_validator('host_ip')
     @classmethod
     def valid_host_ip(cls, value: str) -> str:
-        parsed = ip_address(value)
-        if parsed.version != 4:
-            raise ValueError('Only IPv4 host addresses supported in this release')
-        return str(parsed)
+        return normalize_host_ip(value)
 
 class CreateContainer(BaseModel):
     name: str = Field(min_length=1,max_length=128,pattern=r'^[A-Za-z0-9][A-Za-z0-9_.-]*$')
@@ -60,10 +69,12 @@ class CreateContainer(BaseModel):
         used_bindings = {(entry['HostIp'], entry['HostPort'], port.split('/')[-1]) for port, entries in bindings.items() for entry in entries}
         for binding in self.port_bindings:
             key = f'{binding.container_port}/{binding.protocol}'
-            host_key = (binding.host_ip, str(binding.host_port), binding.protocol)
+            # Wildcard addresses all listen on every interface; treat them as one key so a
+            # duplicate is rejected instead of failing later inside Docker.
+            host_key = (binding.host_ip or '0.0.0.0', str(binding.host_port), binding.protocol)
             if host_key in used_bindings:
                 raise ValueError('Duplicate host address/port/protocol mapping')
-            if binding.host_ip != '127.0.0.1' and not self.acknowledge_public_ports:
+            if is_public_host_ip(binding.host_ip) and not self.acknowledge_public_ports:
                 raise ValueError('Non-localhost port exposure requires explicit acknowledgement')
             used_bindings.add(host_key)
             ports[key] = {}

@@ -5,12 +5,18 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 # shellcheck source=installer/lib.sh
 . "$ROOT/installer/lib.sh"
 APP=/opt/dockerforge/backend
-[[ -f "$APP/app/core.py" && -f /etc/dockerforge/dockerforge.env ]] || { echo 'Existing Task 1-5 foundation not detected; refusing update' >&2; exit 1; }
+[[ -f "$APP/app/core.py" && -f /etc/dockerforge/dockerforge.env ]] || { echo 'Existing DockerForge installation not detected; refusing update' >&2; exit 1; }
 command -v python3 >/dev/null
 command -v systemctl >/dev/null
 systemctl is-active --quiet dockerforge || { echo 'DockerForge is not active; inspect service first' >&2; exit 1; }
-NEW_VERSION=$(grep '^version = ' "$ROOT/backend/pyproject.toml" | cut -d '"' -f 2)
-[[ $NEW_VERSION = 0.7.0 ]] || { echo 'Unexpected package version' >&2; exit 1; }
+NEW_VERSION=$(sed -n 's/^version = "\(.*\)"$/\1/p' "$ROOT/backend/pyproject.toml")
+[[ -n $NEW_VERSION ]] || { echo 'Cannot read the package version from pyproject.toml' >&2; exit 1; }
+CURRENT_VERSION=$(sed -n 's/^version = "\(.*\)"$/\1/p' "$APP/pyproject.toml" 2>/dev/null || true)
+# Never silently downgrade; re-running the same version is supported.
+if [[ -n $CURRENT_VERSION && $CURRENT_VERSION != "$NEW_VERSION" ]]; then
+  newest=$(printf '%s\n%s\n' "$CURRENT_VERSION" "$NEW_VERSION" | sort -V | tail -n 1)
+  [[ $newest == "$NEW_VERSION" ]] || { echo "Refusing to downgrade v$CURRENT_VERSION to v$NEW_VERSION" >&2; exit 1; }
+fi
 STAMP=$(date -u +%Y%m%dT%H%M%SZ)
 BACKUP=/root/dockerforge-upgrade-backup-$STAMP
 mkdir -m 0700 "$BACKUP"
@@ -38,7 +44,7 @@ for alert_file in alert-rules.json alert-state.json; do
     cp -a "/var/lib/dockerforge/$alert_file" "$BACKUP/$alert_file"
   fi
 done
-# Preserve optional v0.7.0 historical metrics when upgrading again.
+# Preserve historical metrics if the collector has already been running.
 if [[ -f /var/lib/dockerforge/metrics.db ]]; then
   METRICS_BACKUP="$BACKUP/metrics.db"; export METRICS_BACKUP
   /opt/dockerforge/venv/bin/python - <<'PYMETRICS'
@@ -47,7 +53,7 @@ with sqlite3.connect('/var/lib/dockerforge/metrics.db') as src, sqlite3.connect(
 PYMETRICS
   chmod 0600 "$METRICS_BACKUP"
 fi
-STAGING=/opt/dockerforge/.v0700-staging-$STAMP
+STAGING=/opt/dockerforge/.staging-$STAMP
 stage_backend "$ROOT/backend" "$STAGING"
 /opt/dockerforge/venv/bin/python -m compileall -q "$STAGING/app"
 rollback() {
@@ -64,6 +70,11 @@ rollback() {
   echo "Backup retained: $BACKUP" >&2
 }
 trap rollback ERR
+# Install any dependency changes from the staged release before swapping code.
+reqs=$(mktemp)
+backend_requirements /opt/dockerforge/venv/bin/python "$STAGING/pyproject.toml" >"$reqs"
+/opt/dockerforge/venv/bin/pip install --quiet --disable-pip-version-check -r "$reqs"
+rm -f "$reqs"
 systemctl stop dockerforge-metrics 2>/dev/null || true
 systemctl stop dockerforge
 # Swap backend; existing venv, DB, user, settings, certificate and service remain untouched.
@@ -77,7 +88,11 @@ install -m 0750 "$ROOT/scripts/bind-backup.py" /usr/local/sbin/dockerforge-bind-
 install -m 0750 "$ROOT/scripts/data-backup-job.py" /usr/local/sbin/dockerforge-data-backup
 install -m 0644 "$ROOT/systemd/dockerforge-data-backup.service" /etc/systemd/system/dockerforge-data-backup.service
 install -m 0644 "$ROOT/systemd/dockerforge-data-backup.timer" /etc/systemd/system/dockerforge-data-backup.timer
-if [[ ! -e /etc/dockerforge/data-backup.json ]]; then install -m 0600 "$ROOT/data-backup.example.json" /etc/dockerforge/data-backup.json; fi
+if [[ ! -e /etc/dockerforge/data-backup.json ]]; then
+  install -m 0640 -o root -g dockerforge "$ROOT/data-backup.example.json" /etc/dockerforge/data-backup.json
+fi
+chown root:dockerforge /etc/dockerforge/data-backup.json
+chmod 0640 /etc/dockerforge/data-backup.json
 install -m 0644 "$ROOT/systemd/dockerforge-backup.service" /etc/systemd/system/dockerforge-backup.service
 install -m 0644 "$ROOT/systemd/dockerforge-backup.timer" /etc/systemd/system/dockerforge-backup.timer
 systemctl daemon-reload
@@ -87,8 +102,8 @@ for _ in {1..15}; do
  if curl -kfsS --silent --max-time 2 https://127.0.0.1:9443/health 2>/dev/null | grep -q '"status":"ok"'; then
    systemctl is-active --quiet dockerforge-metrics || { echo "Collector inactive" >&2; false; }
    trap - ERR
-   echo "DockerForge upgraded to v0.7.0 ($NEW_VERSION). Backup: $BACKUP"
-   echo 'Preview: security review required; existing backup timer settings retained; keep port 9443 restricted.'
+   echo "DockerForge upgraded to v$NEW_VERSION. Backup: $BACKUP"
+   echo 'Existing backup timer settings retained; keep port 9443 restricted.'
    exit 0
  fi
  sleep 1

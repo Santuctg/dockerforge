@@ -1,7 +1,7 @@
 from app.ui import HTML
 
 def test_ui_version():
-    assert 'R1 v0.7.0' in HTML
+    assert 'R1 v0.9.0' in HTML
 
 def test_metrics_cards():
     assert 'metric-card' in HTML

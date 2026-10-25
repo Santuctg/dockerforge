@@ -37,5 +37,5 @@ def test_compose_update_ack_required(tmp_path):
 
 
 def test_ui_integrated_views():
-    for token in ['v0.7.0','hostMetrics','refreshHostMetrics','Edit YAML','Validate & save changes']:
+    for token in ['v0.9.0','hostMetrics','refreshHostMetrics','Edit YAML','Validate & save changes']:
         assert token in HTML

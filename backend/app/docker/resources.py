@@ -1,5 +1,6 @@
 """Input validation for the v0.1.8 Docker resource operations."""
 import re
+from ipaddress import ip_address
 from pydantic import BaseModel, Field, field_validator
 from .containers import IMAGE_RE
 
@@ -45,6 +46,17 @@ class VolumeCreate(BaseModel):
 class TypedDelete(BaseModel):
     confirm_name: str
 
+def _wildcard(value: str) -> bool:
+    return value in ('', '*', '0.0.0.0', '::')
+
+
+def _same_address(left: str, right: str) -> bool:
+    try:
+        return ip_address(left) == ip_address(right)
+    except ValueError:
+        return left == right
+
+
 def validate_port_availability(bindings: list[dict], containers: list[dict]) -> None:
     for binding in bindings:
         host_ip = binding['host_ip']; port = int(binding['host_port']); protocol = binding.get('protocol','tcp')
@@ -55,5 +67,7 @@ def validate_port_availability(bindings: list[dict], containers: list[dict]) -> 
                 if existing.get('PublicPort') != port or existing.get('Type','tcp') != protocol:
                     continue
                 ip = existing.get('IP','0.0.0.0')
-                if ip in ('0.0.0.0','::') or host_ip in ('0.0.0.0','::') or ip == host_ip:
+                # A wildcard on either side covers every address; otherwise compare the
+                # parsed addresses so equivalent IPv6 spellings still conflict.
+                if _wildcard(ip) or _wildcard(host_ip) or _same_address(ip, host_ip):
                     raise ValueError(f'Host port {port}/{protocol} is already published by a running container')

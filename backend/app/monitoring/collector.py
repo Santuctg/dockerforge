@@ -25,9 +25,14 @@ def stop(*_):
     global RUNNING
     RUNNING = False
 
-def collect_once(provider, db_path, workers=MAX_WORKERS, fetch=None):
-    """Bounded worker pool. Failures do not abort the entire sampling cycle."""
-    running = provider.list_containers(all=False)
+def collect_once(provider, db_path, workers=MAX_WORKERS, fetch=None, running=None):
+    """Bounded worker pool. Failures do not abort the entire sampling cycle.
+
+    ``running`` may carry a container inventory already fetched by the caller so a
+    cycle does not ask Docker for the same list twice.
+    """
+    if running is None:
+        running = provider.list_containers(all=False)
     ids = [item.get('Id') for item in running if isinstance(item,dict) and item.get('Id')]
     ids = list(dict.fromkeys(ids))
     fetch = fetch or provider.container_stats
@@ -63,6 +68,19 @@ def publish_status(path, payload):
     tmp.chmod(0o600)
     os.replace(tmp,path)
 
+def inventory_counts(containers):
+    """Count stopped/paused containers. Paused workloads still exist and are not stopped."""
+    stopped = paused = 0
+    for item in containers:
+        if not isinstance(item, dict):
+            continue
+        state = item.get('State')
+        if state in ('exited', 'dead', 'created'):
+            stopped += 1
+        elif state == 'paused':
+            paused += 1
+    return stopped, paused
+
 def classify_alerts(status, *, cpu_threshold=90, memory_threshold=90):
     alerts=[]
     if status.get('overrun'): alerts.append({'type':'collector_overrun','severity':'warning'})
@@ -87,16 +105,25 @@ def main():
     while RUNNING:
         cycle_started=time.monotonic()
         status={'last_attempt':int(time.time()),'last_success':None,'state':'error'}
+        all_containers=None
         try:
             previous={}
             try: previous=json.loads(Path(state).read_text())
             except (OSError,ValueError): pass
             status['last_success']=previous.get('last_success')
-            result=collect_once(provider,db)
-            status.update(result)
+            # One inventory call per cycle feeds both sampling and alert rules.
             try:
-                status['stopped']=sum(c.get('State') not in ('running',) for c in provider.list_containers(all=True) if isinstance(c,dict))
-            except Exception:
+                all_containers=provider.list_containers(all=True)
+            except Exception as exc:
+                all_containers=None
+                status['inventory_error']=type(exc).__name__
+            running_items=None if all_containers is None else [c for c in all_containers if isinstance(c,dict) and c.get('State')=='running']
+            result=collect_once(provider,db,running=running_items)
+            status.update(result)
+            if all_containers is not None:
+                # Paused containers still hold state and are not "stopped" for alerting.
+                status['stopped'], status['paused'] = inventory_counts(all_containers)
+            else:
                 status['stopped']=0
             status['state']='ok' if result['failed']==0 else 'partial'
             if result['collected'] or result['running']==0: status['last_success']=int(time.time())
@@ -108,8 +135,8 @@ def main():
         status['overrun']=status['duration_ms']>interval*1000
         status['alerts']=classify_alerts(status)
         try:
-            all_containers=provider.list_containers(all=True)
-            stopped_ids=[c['Id'] for c in all_containers if isinstance(c,dict) and c.get('State')!='running' and c.get('Id')]
+            inventory=all_containers if all_containers is not None else provider.list_containers(all=True)
+            stopped_ids=[c['Id'] for c in inventory if isinstance(c,dict) and c.get('State') in ('exited','dead','created') and c.get('Id')]
             running_metrics={t['full_id']:t for t in status.get('container_timings',[]) if t.get('full_id')}
             status['rule_alerts']=reconcile(running_metrics,stopped_ids)
             status['rule_alert_count']=len(status['rule_alerts'])

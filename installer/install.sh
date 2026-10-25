@@ -22,7 +22,7 @@ STEPS=(step_preflight step_packages step_docker step_user_dirs step_app
 SYSTEMD_DIR=/etc/systemd/system
 TLS_HOOK=/usr/local/sbin/dockerforge-tls-deploy
 
-DOMAIN='' EMAIL='' ASSUME_YES=0 NO_FIREWALL=0 CHECK_ONLY=0 SKIP_DNS=0 DNS_PROVIDER=''
+DOMAIN='' EMAIL='' ASSUME_YES=0 NO_FIREWALL=0 ALLOW_PUBLIC=0 CHECK_ONLY=0 SKIP_DNS=0 DNS_PROVIDER=''
 FAMILY='' OS_ID='' PY='' BACKUP='' STAGING='' APP_SWAPPED=0 DONE=0
 
 usage() {
@@ -35,6 +35,8 @@ Usage: sudo bash installer/install.sh [options]
                    port 80; works with a local IP. Token from CF_API_TOKEN or asked once
   --yes            Install Docker without asking if it is missing
   --no-firewall    Do not open ports in ufw/firewalld
+  --allow-public   Open 9443/tcp in the firewall. Without this the panel port stays
+                   closed and must be reached through a VPN, tunnel or existing rule
   --skip-dns-check Do not check that --domain points to this server
   --check          Run preflight checks only; change nothing
   --help           Show this help
@@ -51,6 +53,7 @@ parse_args() {
       --email) [[ $# -ge 2 ]] || { echo '--email needs a value' >&2; exit 2; }; EMAIL=$2; shift ;;
       --yes) ASSUME_YES=1 ;;
       --no-firewall) NO_FIREWALL=1 ;;
+      --allow-public) ALLOW_PUBLIC=1 ;;
       --skip-dns-check) SKIP_DNS=1 ;;
       --dns) [[ $# -ge 2 ]] || { echo '--dns needs a value' >&2; exit 2; }; DNS_PROVIDER=$2; shift ;;
       --check) CHECK_ONLY=1 ;;
@@ -141,7 +144,7 @@ step_packages() {
       # openSUSE names the certbot package python3-certbot.
       if [[ -n $DOMAIN ]]; then extra[0]=python3-certbot; fi ;;
   esac
-  pkg_install "${base[@]}" "${extra[@]}"
+  pkg_install "${base[@]}" ${extra[@]+"${extra[@]}"}
   if ! PY=$(find_python); then
     case $FAMILY in
       debian) pkg_install python3.11 python3.11-venv ;;
@@ -258,8 +261,11 @@ step_config() {
   ensure_env_file "$ENV_FILE" || die "Could not create $ENV_FILE"
   chown root:dockerforge "$ENV_FILE"
   if [[ ! -e $CONF/data-backup.json ]]; then
-    install -m 0600 "$ROOT/data-backup.example.json" "$CONF/data-backup.json"
+    # The service runs as dockerforge and must be able to read this file.
+    install -m 0640 -o root -g dockerforge "$ROOT/data-backup.example.json" "$CONF/data-backup.json"
   fi
+  chown root:dockerforge "$CONF/data-backup.json"
+  chmod 0640 "$CONF/data-backup.json"
 }
 
 step_tls() {
@@ -328,20 +334,26 @@ step_services() {
 
 step_firewall() {
   if [[ $NO_FIREWALL -eq 1 ]]; then echo 'Firewall: skipped (--no-firewall)'; return 0; fi
-  local http=0
+  local http=0 panel=$ALLOW_PUBLIC
+  # certbot's HTTP-01 challenge needs port 80 even when the panel stays private.
   if [[ -n $DOMAIN && -z $DNS_PROVIDER ]]; then http=1; fi
+  if [[ $panel -eq 0 && $http -eq 0 ]]; then
+    echo 'Firewall: 9443/tcp left closed (use --allow-public or a VPN/tunnel to reach the panel)'
+    return 0
+  fi
+  local opened=''
   if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q 'Status: active'; then
-    ufw allow 9443/tcp
-    if [[ $http -eq 1 ]]; then ufw allow 80/tcp; fi
+    if [[ $panel -eq 1 ]]; then ufw allow 9443/tcp; opened='9443/tcp'; fi
+    if [[ $http -eq 1 ]]; then ufw allow 80/tcp; opened="${opened:+$opened and }80/tcp"; fi
   elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
-    firewall-cmd --quiet --permanent --add-port=9443/tcp
-    if [[ $http -eq 1 ]]; then firewall-cmd --quiet --permanent --add-port=80/tcp; fi
+    if [[ $panel -eq 1 ]]; then firewall-cmd --quiet --permanent --add-port=9443/tcp; opened='9443/tcp'; fi
+    if [[ $http -eq 1 ]]; then firewall-cmd --quiet --permanent --add-port=80/tcp; opened="${opened:+$opened and }80/tcp"; fi
     firewall-cmd --quiet --reload
   else
     echo 'Firewall: no active ufw/firewalld found, nothing changed'
     return 0
   fi
-  if [[ $http -eq 1 ]]; then echo 'Firewall: opened 9443/tcp and 80/tcp'; else echo 'Firewall: opened 9443/tcp'; fi
+  echo "Firewall: opened $opened"
 }
 
 step_verify() {

@@ -5,5 +5,5 @@ def test_container_workspace_refinement():
         assert token in HTML
 
 def test_original_action_contract_retained():
-    for token in ('createContainer(true)','createContainer(false)','deleteContainer(id,name)','encodeURIComponent(id)','publicPorts','ackRisk','newImage','newName'):
+    for token in ('createContainer(','data-action="create-container"','data-start="0"','data-start="1"','deleteContainer(id,name)','encodeURIComponent(id)','publicPorts','ackRisk','newImage','newName'):
         assert token in HTML

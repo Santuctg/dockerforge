@@ -10,4 +10,4 @@ def test_fullscreen_and_follow_controls():
         assert token in HTML
 
 def test_version():
-    assert 'DockerForge R1 v0.7.0' in HTML
+    assert 'DockerForge R1 v0.9.0' in HTML

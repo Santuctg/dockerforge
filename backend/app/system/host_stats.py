@@ -7,22 +7,42 @@ import time
 
 def _mem():
     values={}
-    for line in Path('/proc/meminfo').read_text().splitlines():
-        k,_,v=line.partition(':')
-        if k in ('MemTotal','MemAvailable','SwapTotal','SwapFree'):
-            values[k]=int(v.strip().split()[0])*1024
+    try:
+        lines=Path('/proc/meminfo').read_text().splitlines()
+    except OSError:
+        lines=[]
+    for line in lines:
+        k,sep,v=line.partition(':')
+        if not sep or k not in ('MemTotal','MemAvailable','SwapTotal','SwapFree'):
+            continue
+        try: values[k]=int(v.strip().split()[0])*1024
+        except (ValueError,IndexError): continue
+    if not values:
+        # Non-Linux hosts (or a stripped container) have no procfs; fall back to
+        # sysconf so the endpoint still returns a usable snapshot.
+        try:
+            page=int(os.sysconf('SC_PAGE_SIZE'))
+            values['MemTotal']=int(os.sysconf('SC_PHYS_PAGES'))*page
+            values['MemAvailable']=int(os.sysconf('SC_AVPHYS_PAGES'))*page
+        except (ValueError,OSError,AttributeError):
+            pass
     return values
 
 
 def _net():
     data={}
-    for line in Path('/proc/net/dev').read_text().splitlines()[2:]:
+    try:
+        lines=Path('/proc/net/dev').read_text().splitlines()[2:]
+    except OSError:
+        return data
+    for line in lines:
         name,sep,values=line.partition(':')
         name=name.strip()
         if not sep or name=='lo' or not name or len(name)>64:continue
         fields=values.split()
         if len(fields)<16:continue
-        data[name]={'rx_bytes':int(fields[0]),'tx_bytes':int(fields[8])}
+        try: data[name]={'rx_bytes':int(fields[0]),'tx_bytes':int(fields[8])}
+        except ValueError: continue
     return data
 
 

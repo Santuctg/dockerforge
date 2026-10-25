@@ -339,8 +339,11 @@ def test_cloudflare_credentials_from_env_then_kept(tmp_path):
 def test_cloudflare_credentials_rejects_missing_or_bad_token(tmp_path):
     ini = tmp_path / 'cloudflare.ini'
     env = {k: v for k, v in os.environ.items() if k != 'CF_API_TOKEN'}
-    missing = subprocess.run(['setsid', 'bash', '-c', f'source "{LIB}"; ensure_cloudflare_credentials "{ini}"'],
-                             capture_output=True, text=True, env=env, stdin=subprocess.DEVNULL)
+    # A new session has no controlling terminal, so the interactive /dev/tty prompt is
+    # skipped portably (setsid is Linux-only).
+    missing = subprocess.run(['bash', '-c', f'source "{LIB}"; ensure_cloudflare_credentials "{ini}"'],
+                             capture_output=True, text=True, env=env, stdin=subprocess.DEVNULL,
+                             start_new_session=True)
     assert missing.returncode != 0 and not ini.exists()
     bad = sh(f'ensure_cloudflare_credentials "{ini}" </dev/null', env={'CF_API_TOKEN': 'bad token; rm -rf /'})
     assert bad.returncode != 0 and not ini.exists()
@@ -372,10 +375,25 @@ def test_dns_mode_skips_port80_and_dns_check(tmp_path):
         'port_in_use() { return 0; }; preflight_domain && echo PREFLIGHT_OK',
         {'getent': 'exit 2'})
     assert 'PREFLIGHT_OK' in r.stdout, r.stderr
-    r2, calls2 = run_install_fn(tmp_path, 'DOMAIN=docker.example.com; DNS_PROVIDER=cloudflare; NO_FIREWALL=0; step_firewall',
+    r2, calls2 = run_install_fn(tmp_path, 'DOMAIN=docker.example.com; DNS_PROVIDER=cloudflare; NO_FIREWALL=0; ALLOW_PUBLIC=1; step_firewall',
                                 {'ufw': '[[ "$1" == status ]] && echo "Status: active"; exit 0'})
     assert 'ufw allow 9443/tcp' in calls2
     assert 'ufw allow 80/tcp' not in calls2
+
+
+def test_firewall_keeps_panel_closed_by_default(tmp_path):
+    r, calls = run_install_fn(tmp_path, 'NO_FIREWALL=0; ALLOW_PUBLIC=0; step_firewall',
+                              {'ufw': '[[ "$1" == status ]] && echo "Status: active"; exit 0'})
+    assert r.returncode == 0, r.stderr
+    assert 'ufw allow' not in calls
+    assert '9443/tcp left closed' in r.stdout
+
+
+def test_firewall_opens_only_port80_for_letsencrypt(tmp_path):
+    r, calls = run_install_fn(tmp_path, 'DOMAIN=docker.example.com; DNS_PROVIDER=; NO_FIREWALL=0; ALLOW_PUBLIC=0; step_firewall',
+                              {'ufw': '[[ "$1" == status ]] && echo "Status: active"; exit 0'})
+    assert 'ufw allow 80/tcp' in calls
+    assert 'ufw allow 9443/tcp' not in calls
 
 
 # --- security hardening: scripts and units ---

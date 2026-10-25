@@ -23,5 +23,5 @@ def test_reject_bad_tail(tail):
     with pytest.raises(ValueError):tools.logs('demo',tail)
 
 def test_ui_features():
-    for token in ('Previous commands','Download filtered','Follow (5s polling)','Timestamps','1000','v0.7.0'):
+    for token in ('Previous commands','Download filtered','Follow (5s polling)','Timestamps','1000','v0.9.0'):
         assert token in HTML

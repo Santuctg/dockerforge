@@ -1,4 +1,5 @@
 import hashlib, json, os, secrets, sqlite3, time, uuid
+from ipaddress import ip_address, ip_network
 from pathlib import Path
 from threading import Lock
 from argon2 import PasswordHasher
@@ -32,6 +33,15 @@ _failed_lock = Lock()
 FAILED_CAP = 10000
 # Failures per client IP across all usernames; also stops key floods from evicting a lockout.
 IP_FAILURE_LIMIT = 30
+# A browser tab fetches a CSRF token on load; keep a few recent tokens per session so
+# two open tabs cannot invalidate each other. Only the newest few are retained.
+CSRF_TOKENS_PER_SESSION = 8
+# Audit growth is bounded; old rows are deleted on startup and periodically on write.
+AUDIT_RETENTION_DAYS = 180
+AUDIT_MAX_ROWS = 200000
+AUDIT_PRUNE_EVERY = 200
+_audit_writes = 0
+_audit_lock = Lock()
 
 def conn():
     Path(os.environ.get('DOCKERFORGE_DB',DB)).parent.mkdir(parents=True,exist_ok=True)
@@ -47,10 +57,50 @@ def initialize():
         CREATE TABLE IF NOT EXISTS sessions(id_hash TEXT PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id), csrf_hash TEXT NOT NULL, created_at INTEGER NOT NULL, last_seen INTEGER NOT NULL, expires_at INTEGER NOT NULL);
         CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY, ts INTEGER NOT NULL, actor TEXT, action TEXT NOT NULL, resource TEXT, ip TEXT, result TEXT NOT NULL, request_id TEXT, metadata TEXT NOT NULL);
         CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit(ts DESC);
+        CREATE TABLE IF NOT EXISTS session_csrf(id_hash TEXT NOT NULL REFERENCES sessions(id_hash) ON DELETE CASCADE, csrf_hash TEXT NOT NULL, created_at INTEGER NOT NULL, PRIMARY KEY(id_hash,csrf_hash));
         CREATE TABLE IF NOT EXISTS container_backups(name TEXT PRIMARY KEY, new_id TEXT NOT NULL, old_id TEXT NOT NULL, old_name TEXT NOT NULL, created_at INTEGER NOT NULL, restart_policy TEXT NOT NULL DEFAULT '{}');''')
+        prune_audit(db)
+
+def prune_audit(db, now=None, retention_days=None, max_rows=None):
+    """Keep the audit trail bounded: drop rows past retention, then the oldest over the cap."""
+    now = int(time.time() if now is None else now)
+    days = AUDIT_RETENTION_DAYS if retention_days is None else retention_days
+    cap = AUDIT_MAX_ROWS if max_rows is None else max_rows
+    db.execute('DELETE FROM audit WHERE ts < ?', (now - days * 86400,))
+    total = db.execute('SELECT COUNT(*) FROM audit').fetchone()[0]
+    if total > cap:
+        db.execute('DELETE FROM audit WHERE id IN (SELECT id FROM audit ORDER BY id ASC LIMIT ?)', (total - cap,))
 
 def digest(value):return hashlib.sha256(value.encode()).hexdigest()
-def client_ip(req):return req.client.host if req.client else 'unknown'
+
+def _trusted_proxies():
+    """Parse DOCKERFORGE_TRUSTED_PROXIES (comma separated IPs/CIDRs); invalid entries are ignored."""
+    networks=[]
+    for part in os.environ.get('DOCKERFORGE_TRUSTED_PROXIES','').split(','):
+        part=part.strip()
+        if not part:continue
+        try:networks.append(ip_network(part,strict=False))
+        except ValueError:continue
+    return tuple(networks)
+
+def client_ip(req):
+    """Peer address, or the right-most untrusted X-Forwarded-For hop behind a trusted proxy."""
+    peer=req.client.host if req.client else 'unknown'
+    try:peer_addr=ip_address(peer)
+    except ValueError:return peer  # TestClient and other non-IP peers
+    trusted=_trusted_proxies()
+    if not trusted or not any(peer_addr in net for net in trusted):return peer
+    hops=[]
+    for part in req.headers.get('x-forwarded-for','').split(','):
+        part=part.strip()
+        if not part:continue
+        try:hops.append(ip_address(part))
+        except ValueError:continue
+    # Walk from the proxy side inwards and stop at the first address we do not control;
+    # a client-supplied X-Forwarded-For prefix is therefore never trusted.
+    for hop in reversed(hops):
+        if not any(hop in net for net in trusted):return str(hop)
+    return peer
 
 def redact(value):
     if isinstance(value,dict):return {k:('[REDACTED]' if any(w in k.lower() for w in ('password','token','secret','key','stdin','keystroke','credential','env')) else redact(v)) for k,v in value.items()}
@@ -58,8 +108,13 @@ def redact(value):
     return value
 
 def audit(req, action, result='success', user=None, resource=None, metadata=None):
+    global _audit_writes
     with conn() as db:
         db.execute('INSERT INTO audit(ts,actor,action,resource,ip,result,request_id,metadata) VALUES(?,?,?,?,?,?,?,?)',(int(time.time()),user,action,resource,client_ip(req),result,getattr(req.state,'request_id',''),json.dumps(redact(metadata or {}))))
+        with _audit_lock:
+            _audit_writes += 1
+            due = _audit_writes % AUDIT_PRUNE_EVERY == 0
+        if due: prune_audit(db)
 
 def prune_failed(now,cap=None):
     cap=FAILED_CAP if cap is None else cap
@@ -99,9 +154,21 @@ def require_csrf(req:Request):
     user=require_user(req)
     cookie=req.cookies.get(CSRF_COOKIE,'')
     supplied=req.headers.get('X-CSRF-Token','')
-    if not cookie or not secrets.compare_digest(cookie,supplied) or not secrets.compare_digest(user['csrf_hash'],digest(cookie)):
-        fail('CSRF_INVALID','Invalid CSRF token',403)
+    if not cookie or not supplied:fail('CSRF_INVALID','Invalid CSRF token',403)
+    # The header token is what a cross-site page cannot forge. Browsers share one cookie
+    # jar across tabs, so a token fetched in another tab may be the current cookie while
+    # this tab still sends an older header token; both must be known to this session.
+    if secrets.compare_digest(user['csrf_hash'],digest(supplied)):return user
+    with conn() as db:
+        known=db.execute('SELECT 1 FROM session_csrf WHERE id_hash=? AND csrf_hash=?',(user['id_hash'],digest(supplied))).fetchone()
+    if not known:fail('CSRF_INVALID','Invalid CSRF token',403)
     return user
+
+def _remember_csrf(db, id_hash, token, now=None):
+    """Track an issued CSRF token and keep only the newest few per session."""
+    stamp=int(time.time() if now is None else now)
+    db.execute('INSERT OR REPLACE INTO session_csrf(id_hash,csrf_hash,created_at) VALUES(?,?,?)',(id_hash,digest(token),stamp))
+    db.execute('DELETE FROM session_csrf WHERE id_hash=? AND csrf_hash NOT IN (SELECT csrf_hash FROM session_csrf WHERE id_hash=? ORDER BY created_at DESC, rowid DESC LIMIT ?)',(id_hash,id_hash,CSRF_TOKENS_PER_SESSION))
 
 class SqliteBackupStore:
     """One recreate backup per container name, kept in the application database."""
@@ -157,7 +224,7 @@ def provider(timeout=8.0):return LocalDockerProvider(os.environ.get('DOCKERFORGE
 
 def create_app():
     initialize()
-    app=FastAPI(title='DockerForge R1 Integrated Foundation',version='0.7.0')
+    app=FastAPI(title='DockerForge R1',version='0.9.0')
     @app.middleware('http')
     async def request_id(req,call_next):
         v=req.headers.get('X-Request-ID','')
@@ -172,6 +239,9 @@ def create_app():
         res.headers['X-Frame-Options']='DENY'
         res.headers['Referrer-Policy']='no-referrer'
         res.headers['Strict-Transport-Security']='max-age=31536000'
+        res.headers['Permissions-Policy']='camera=(), microphone=(), geolocation=()'
+        # API responses load nothing; the panel sets its own nonce-based policy in home().
+        res.headers.setdefault('Content-Security-Policy',"default-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'")
         return res
     @app.exception_handler(HTTPException)
     async def http_error(req,exc):
@@ -180,7 +250,16 @@ def create_app():
     @app.get('/',response_class=HTMLResponse)
     def home():
         from app.ui import HTML
-        return HTML
+        nonce=secrets.token_urlsafe(18)
+        res=HTMLResponse(HTML.replace('__CSP_NONCE__',nonce))
+        # Inline styles are allowed (they carry no script capability); inline scripts and
+        # event-handler attributes are not, so injected markup cannot execute.
+        res.headers['Content-Security-Policy']=(
+            "default-src 'self'; script-src 'nonce-"+nonce+"'; "
+            "style-src 'self' 'unsafe-inline'; img-src 'self' data:; "
+            "connect-src 'self'; font-src 'self'; frame-ancestors 'none'; "
+            "base-uri 'none'; form-action 'self'; object-src 'none'")
+        return res
     @app.get('/health')
     def health():return {'status':'ok','database':'ok'}
     @app.get('/api/v1/auth/setup/status')
@@ -200,10 +279,16 @@ def create_app():
         return {'username':body.username,'role':'super_admin'}
     @app.get('/api/v1/auth/csrf')
     def csrf(req:Request):
-        val=secrets.token_urlsafe(32)
         user=user_from_session(req)
         if user:
-            with conn() as db:db.execute('UPDATE sessions SET csrf_hash=? WHERE id_hash=?',(digest(val),user['id_hash']))
+            val=secrets.token_urlsafe(32)
+            with conn() as db:
+                db.execute('UPDATE sessions SET csrf_hash=? WHERE id_hash=?',(digest(val),user['id_hash']))
+                _remember_csrf(db,user['id_hash'],val)
+        else:
+            # Pre-login double-submit token: reuse the existing cookie so opening a
+            # second login tab does not invalidate the first tab's form.
+            val=req.cookies.get(CSRF_COOKIE) or secrets.token_urlsafe(32)
         res=JSONResponse({'csrf_token':val})
         res.set_cookie(CSRF_COOKIE,val,secure=True,httponly=True,samesite='lax',path='/')
         return res
@@ -229,7 +314,9 @@ def create_app():
             audit(req,'auth.login','denied',user=body.username);fail('LOGIN_FAILED','Invalid credentials',401)
         with _failed_lock:_failed.pop(key,None)
         token=secrets.token_urlsafe(48);csrf=secrets.token_urlsafe(32)
-        with conn() as db:db.execute('INSERT INTO sessions VALUES(?,?,?,?,?,?)',(digest(token),r['id'],digest(csrf),now,now,now+86400))
+        with conn() as db:
+            db.execute('INSERT INTO sessions VALUES(?,?,?,?,?,?)',(digest(token),r['id'],digest(csrf),now,now,now+86400))
+            _remember_csrf(db,digest(token),csrf,now)
         res=JSONResponse({'username':r['username'],'role':r['role'],'csrf_token':csrf})
         res.set_cookie(COOKIE,token,httponly=True,secure=True,samesite='lax',path='/')
         res.set_cookie(CSRF_COOKIE,csrf,httponly=True,secure=True,samesite='lax',path='/')
@@ -705,7 +792,7 @@ def create_app():
     def delete_container(ident:str, body:DeleteConfirmation,req:Request,user=Depends(require_csrf)):
         if user['role'] not in ADMINS:fail('FORBIDDEN','Deletion requires Admin',403)
         if body.confirm_name != ident:fail('CONFIRMATION_MISMATCH','Type the exact container ID or name to delete',409)
-        if body.remove_volumes:fail('VOLUME_DELETE_BLOCKED','Container deletion with volume removal is disabled in Task 6',403)
+        if body.remove_volumes:fail('VOLUME_DELETE_BLOCKED','Container deletion with volume removal is disabled in this release',403)
         return _mutate(req,user,'delete',ident,lambda:provider().delete_container(ident,force=body.force))
 
     @app.get('/api/v1/dashboard')

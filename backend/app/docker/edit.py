@@ -3,10 +3,9 @@ import copy
 import json
 import re
 import time
-from ipaddress import ip_address
 from typing import Literal
 from pydantic import BaseModel, Field, field_validator
-from .containers import IMAGE_RE
+from .containers import IMAGE_RE, is_public_host_ip, normalize_host_ip
 from .errors import DockerOperationError
 
 MOUNT_RE = re.compile(r'^(/[^:]+|[A-Za-z0-9][A-Za-z0-9_.-]*):(/[^:]*)(:(ro|rw))?$')
@@ -25,7 +24,7 @@ class EditPortBinding(BaseModel):
     @field_validator('host_ip')
     @classmethod
     def valid_host_ip(cls, value):
-        return value if value == '' else str(ip_address(value))
+        return normalize_host_ip(value)
 
 
 class ContainerEdit(BaseModel):
@@ -154,7 +153,7 @@ def build_create_body(details, old_image, edit):
     if edit.command is not None: config['Cmd'] = edit.command
     bindings, exposed = {}, {}
     for b in edit.port_bindings:
-        if b.host_ip != '127.0.0.1' and not edit.acknowledge_public_ports:
+        if is_public_host_ip(b.host_ip) and not edit.acknowledge_public_ports:
             raise ValueError('Non-localhost port exposure requires explicit acknowledgement')
         key = f'{b.container_port}/{b.protocol}'
         exposed[key] = {}
